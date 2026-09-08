@@ -232,6 +232,114 @@ data:
         except Exception as e:
             return jsonify({"flink_status": "ERROR", "detail": str(e)})
 
+    # ── Aviation Flight Tracker — OpenSky proxy (ORY bounding box) ────────────
+    _OPENSKY_TRACKER_URL = (
+        "https://opensky-network.org/api/states/all"
+        "?lamin=48.10&lomin=1.90&lamax=49.15&lomax=2.90"
+    )
+    _OPENSKY_TOKEN_URL = "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token"
+    _tracker_cache: dict = {"states": [], "fetched_at": None, "error": None, "retry_after": None}
+    _tracker_lock = threading.Lock()
+    _tracker_token_cache: dict = {"access_token": None, "expires_at": 0.0}
+    _tracker_token_lock = threading.Lock()
+
+    _TRACKER_CLIENT_ID     = os.environ.get("OPENSKY_CLIENT_ID", "")
+    _TRACKER_CLIENT_SECRET = os.environ.get("OPENSKY_CLIENT_SECRET", "")
+    _TRACKER_CREDS_FILE    = os.environ.get("OPENSKY_CREDENTIALS_FILE", "/etc/opensky/credentials.json")
+    if (not _TRACKER_CLIENT_ID) and os.path.exists(_TRACKER_CREDS_FILE):
+        try:
+            _creds = json.loads(open(_TRACKER_CREDS_FILE).read())
+            _TRACKER_CLIENT_ID     = _creds.get("clientId", "")
+            _TRACKER_CLIENT_SECRET = _creds.get("clientSecret", "")
+        except Exception:
+            pass
+
+    def _tracker_get_token():
+        if not _TRACKER_CLIENT_ID:
+            return None
+        with _tracker_token_lock:
+            now = time.time()
+            if _tracker_token_cache["access_token"] and now < _tracker_token_cache["expires_at"] - 30:
+                return _tracker_token_cache["access_token"]
+            resp = _requests.post(
+                _OPENSKY_TOKEN_URL,
+                data={"grant_type": "client_credentials",
+                      "client_id": _TRACKER_CLIENT_ID,
+                      "client_secret": _TRACKER_CLIENT_SECRET},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            tok = resp.json()
+            _tracker_token_cache["access_token"] = tok["access_token"]
+            _tracker_token_cache["expires_at"]   = now + tok.get("expires_in", 300)
+            return _tracker_token_cache["access_token"]
+
+    def _tracker_fetch_loop():
+        backoff = 0
+        while True:
+            try:
+                token = _tracker_get_token()
+                headers = {"Authorization": f"Bearer {token}"} if token else {}
+                resp = _requests.get(_OPENSKY_TRACKER_URL, timeout=20, headers=headers)
+                if resp.status_code == 429:
+                    backoff += 1
+                    delay = min(60 * (2 ** backoff), 600)
+                    retry_at = datetime.now(timezone.utc).timestamp() + delay
+                    with _tracker_lock:
+                        _tracker_cache["error"] = f"Rate limit OpenSky (429) — retry in {delay}s"
+                        _tracker_cache["retry_after"] = retry_at
+                    time.sleep(delay)
+                    continue
+                resp.raise_for_status()
+                data  = resp.json()
+                states = data.get("states") or []
+                backoff = 0
+                with _tracker_lock:
+                    _tracker_cache["states"]      = states
+                    _tracker_cache["fetched_at"]  = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+                    _tracker_cache["error"]       = None
+                    _tracker_cache["retry_after"] = None
+            except Exception as exc:
+                with _tracker_lock:
+                    _tracker_cache["error"]      = str(exc)
+                    _tracker_cache["fetched_at"] = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+            time.sleep(60)
+
+    threading.Thread(target=_tracker_fetch_loop, daemon=True).start()
+
+    @app.route("/api/tracker")
+    def api_tracker():
+        with _tracker_lock:
+            return jsonify({
+                "states":      _tracker_cache["states"],
+                "fetched_at":  _tracker_cache["fetched_at"],
+                "error":       _tracker_cache["error"],
+                "retry_after": _tracker_cache["retry_after"],
+            })
+
+    _LEAFLET_JS = None  # cached on first read
+
+    @app.route("/static/leaflet.js")
+    def static_leaflet():
+        """Serve the Leaflet 1.9.4 bundle from the aviation-tracker app.py
+        so the tracker tab can load it without internet access."""
+        global _LEAFLET_JS
+        from flask import Response
+        if _LEAFLET_JS is None:
+            try:
+                # Attempt to load from aviation-tracker on same cluster
+                r = _requests.get(
+                    "http://aviation-tracker.test-app.svc.cluster.local:8080/static/leaflet.js",
+                    timeout=5)
+                if r.ok:
+                    _LEAFLET_JS = r.text
+            except Exception:
+                pass
+        if _LEAFLET_JS:
+            return Response(_LEAFLET_JS, mimetype="application/javascript",
+                            headers={"Cache-Control": "public, max-age=86400"})
+        return Response("// Leaflet not available", mimetype="application/javascript"), 503
+
     # ── Simulator control routes ──
     def _scale_simulator(replicas):
         """Scale adsb-simulator deployment via the in-cluster Kubernetes API.
@@ -583,6 +691,45 @@ data:
         .sim-status { font-size:11px; color:#8b949e; margin-left:4px;
                       max-width:380px; overflow:hidden; text-overflow:ellipsis;
                       white-space:nowrap; display:inline-block; vertical-align:middle; }
+
+        /* ── Aviation Flight Tracker tab ── */
+        #tab-tracker { display:none; flex:1; overflow:hidden; }
+        #tab-tracker.active { display:flex; }
+        #tracker-map { flex:0 0 60%; height:100%; min-height:500px; background:#0d1117; }
+        .tracker-panel { flex:1; display:flex; flex-direction:column; overflow:hidden;
+                         border-left:1px solid #30363d; background:#0d1117; }
+        .tracker-stats { display:flex; gap:8px; padding:8px 12px;
+                         background:#161b22; border-bottom:1px solid #21262d; flex-wrap:wrap; }
+        .tracker-stat { background:#0d1117; border:1px solid #30363d; border-radius:6px;
+                        padding:5px 12px; min-width:90px; text-align:center; }
+        .tracker-stat .tv  { font-size:18px; font-weight:700; color:#58a6ff; }
+        .tracker-stat .tl  { font-size:10px; color:#8b949e; margin-top:1px; }
+        .tracker-stat.green .tv { color:#3fb950; }
+        .tracker-stat.yellow .tv { color:#d29922; }
+        .tracker-stat.red .tv { color:#f85149; }
+        .tracker-err { background:#3d1a1a; border-bottom:1px solid #f85149;
+                       padding:5px 12px; color:#f85149; font-size:11px; display:none; }
+        .tracker-table-wrap { overflow-y:auto; flex:1; }
+        #tracker-table { width:100%; border-collapse:collapse; font-size:12px; }
+        #tracker-table thead tr { background:#1a2744; position:sticky; top:0; z-index:1; }
+        #tracker-table th { padding:6px 8px; text-align:left; font-weight:600;
+                            color:#8b949e; border-bottom:1px solid #30363d; white-space:nowrap; }
+        #tracker-table td { padding:5px 8px; border-bottom:1px solid #21262d; white-space:nowrap; }
+        #tracker-table tr:last-child td { border-bottom:none; }
+        #tracker-table tbody tr { cursor:pointer; }
+        #tracker-table tbody tr:hover td { background:#1c2128; }
+        #tracker-table tbody tr.t-sel td { background:#1a2744; }
+        .t-fly { color:#3fb950; font-weight:600; }
+        .t-gnd { color:#d29922; }
+        .t-appr { color:#f85149; font-weight:700; }
+        #tracker-statusbar { padding:4px 10px; font-size:11px; color:#8b949e;
+                             background:#161b22; border-top:1px solid #21262d; flex-shrink:0; }
+        /* Leaflet popup dark theme inside tracker */
+        #tracker-map .leaflet-popup-content-wrapper {
+          background:#1a2744; color:#e6edf3; border:1px solid #30363d;
+          border-radius:8px; font-size:12px;
+        }
+        #tracker-map .leaflet-popup-tip { background:#1a2744; }
       </style>
     </head>
     <body>
@@ -601,6 +748,7 @@ data:
         <div class="tab active" id="tab-btn-sim">🧪 Simulated<span class="tab-badge empty" id="tab-badge-sim">0</span></div>
         <div class="tab"        id="tab-btn-live">📡 Live — OpenSky ADS-B<span class="tab-badge empty" id="tab-badge-live">0</span></div>
         <div class="tab"        id="tab-btn-events">🧪 Simulated Flight Events</div>
+        <div class="tab"        id="tab-btn-tracker">✈ Aviation Flight Tracker</div>
         <div class="tab"        id="tab-btn-about">📖 About &amp; Architecture</div>
       </div>
 
@@ -712,6 +860,35 @@ data:
 
         </div>
       </div><!-- /tab-events -->
+
+      <!-- ══════════════════════ TAB: AVIATION FLIGHT TRACKER ══════════════════════ -->
+      <div id="tab-tracker" class="tabcontent">
+        <div id="tracker-map"></div>
+        <div class="tracker-panel">
+          <div class="tracker-stats">
+            <div class="tracker-stat"><div class="tv" id="tr-total">–</div><div class="tl">Aircraft</div></div>
+            <div class="tracker-stat green"><div class="tv" id="tr-flying">–</div><div class="tl">In flight</div></div>
+            <div class="tracker-stat yellow"><div class="tv" id="tr-ground">–</div><div class="tl">On ground</div></div>
+            <div class="tracker-stat red"><div class="tv" id="tr-appr">–</div><div class="tl">On approach</div></div>
+            <div class="tracker-stat"><div class="tv" id="tr-updated" style="font-size:11px;padding-top:4px">–</div><div class="tl">Updated</div></div>
+          </div>
+          <div class="tracker-err" id="tracker-err"></div>
+          <div class="tracker-table-wrap">
+            <table id="tracker-table">
+              <thead>
+                <tr>
+                  <th>#</th><th>Callsign</th><th>Country</th>
+                  <th>Alt (m)</th><th>Vrate</th><th>Speed (kt)</th><th>Track°</th><th>Status</th>
+                </tr>
+              </thead>
+              <tbody id="tracker-tbody">
+                <tr><td colspan="8" style="text-align:center;color:#8b949e;padding:20px">Loading…</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div id="tracker-statusbar">Connecting to OpenSky (ORY box)…</div>
+        </div>
+      </div><!-- /tab-tracker -->
 
       <div id="tab-about" class="tabcontent">
         <div class="about">
@@ -1650,6 +1827,10 @@ data:
           document.getElementById('tab-btn-sim').addEventListener('click',    function(){ showTab('sim'); });
           document.getElementById('tab-btn-live').addEventListener('click',   function(){ showTab('live'); });
           document.getElementById('tab-btn-events').addEventListener('click', function(){ showTab('events'); });
+          document.getElementById('tab-btn-tracker').addEventListener('click', function(){
+            showTab('tracker');
+            trackerActivate();
+          });
           document.getElementById('tab-btn-about').addEventListener('click',  function(){ showTab('about'); });
           document.getElementById('drawerOverlay').addEventListener('click', closeDrawer);
 
@@ -2097,6 +2278,316 @@ data:
             'Alert published to Kafka topic <code>ory_corridor_overload</code>.</p>' +
             (a.window_start ? '<p style="color:#8b949e;font-size:11px;">Window: ' + a.window_start + ' → ' + a.window_end + '</p>' : '');
         }
+
+        /* ══════════════════════ AVIATION FLIGHT TRACKER JS ══════════════════════ */
+        (function() {
+          var _trackerMap        = null;   // Leaflet map instance
+          var _trackerMarkers    = {};     // icao24 → L.Marker
+          var _trackerPollTimer  = null;
+          var _trackerReady      = false;
+          var _trackerSelRow     = null;
+
+          /* ── Lazy-load Leaflet CSS ── */
+          function _injectLeafletCSS() {
+            if (document.getElementById('leaflet-css-tracker')) return;
+            var st = document.createElement('style');
+            st.id = 'leaflet-css-tracker';
+            st.textContent = [
+              '.leaflet-pane,.leaflet-tile,.leaflet-marker-icon,.leaflet-marker-shadow,',
+              '.leaflet-tile-container,.leaflet-pane>svg,.leaflet-pane>canvas,',
+              '.leaflet-zoom-box,.leaflet-image-layer,.leaflet-layer{position:absolute;left:0;top:0}',
+              '.leaflet-container{overflow:hidden}',
+              '.leaflet-tile,.leaflet-marker-icon,.leaflet-marker-shadow{-webkit-user-select:none;-moz-user-select:none;user-select:none;-webkit-user-drag:none}',
+              '.leaflet-tile::selection{background:transparent}',
+              '.leaflet-marker-icon,.leaflet-marker-shadow{display:block}',
+              '.leaflet-container .leaflet-overlay-pane svg{max-width:none!important;max-height:none!important}',
+              '.leaflet-container .leaflet-marker-pane img,.leaflet-container .leaflet-shadow-pane img,',
+              '.leaflet-container .leaflet-tile-pane img,.leaflet-container img.leaflet-image-layer,',
+              '.leaflet-container .leaflet-tile{max-width:none!important;max-height:none!important;width:auto;padding:0}',
+              '.leaflet-container img.leaflet-tile{mix-blend-mode:plus-lighter}',
+              '.leaflet-container.leaflet-touch-zoom{-ms-touch-action:pan-x pan-y;touch-action:pan-x pan-y}',
+              '.leaflet-container.leaflet-touch-drag{-ms-touch-action:pinch-zoom;touch-action:none;touch-action:pinch-zoom}',
+              '.leaflet-container.leaflet-touch-drag.leaflet-touch-zoom{-ms-touch-action:none;touch-action:none}',
+              '.leaflet-container{-webkit-tap-highlight-color:transparent}',
+              '.leaflet-tile{filter:inherit;visibility:hidden}.leaflet-tile-loaded{visibility:inherit}',
+              '.leaflet-zoom-box{width:0;height:0;box-sizing:border-box;z-index:800}',
+              '.leaflet-overlay-pane svg{-moz-user-select:none}',
+              '.leaflet-pane{z-index:400}.leaflet-tile-pane{z-index:200}.leaflet-overlay-pane{z-index:400}',
+              '.leaflet-shadow-pane{z-index:500}.leaflet-marker-pane{z-index:600}',
+              '.leaflet-tooltip-pane{z-index:650}.leaflet-popup-pane{z-index:700}',
+              '.leaflet-map-pane canvas{z-index:100}.leaflet-map-pane svg{z-index:200}',
+              '.leaflet-control{position:relative;z-index:800;pointer-events:auto;float:left;clear:both}',
+              '.leaflet-top,.leaflet-bottom{position:absolute;z-index:1000;pointer-events:none}',
+              '.leaflet-top{top:0}.leaflet-right{right:0}.leaflet-bottom{bottom:0}.leaflet-left{left:0}',
+              '.leaflet-right .leaflet-control{float:right}',
+              '.leaflet-top .leaflet-control{margin-top:10px}.leaflet-bottom .leaflet-control{margin-bottom:10px}',
+              '.leaflet-left .leaflet-control{margin-left:10px}.leaflet-right .leaflet-control{margin-right:10px}',
+              '.leaflet-fade-anim .leaflet-popup{opacity:0;-webkit-transition:opacity .2s linear;transition:opacity .2s linear}',
+              '.leaflet-fade-anim .leaflet-map-pane .leaflet-popup{opacity:1}',
+              '.leaflet-zoom-animated{-webkit-transform-origin:0 0;transform-origin:0 0}',
+              'svg.leaflet-zoom-animated{will-change:transform}',
+              '.leaflet-zoom-anim .leaflet-zoom-animated{-webkit-transition:-webkit-transform .25s cubic-bezier(0,0,.25,1);transition:transform .25s cubic-bezier(0,0,.25,1)}',
+              '.leaflet-zoom-anim .leaflet-tile,.leaflet-pan-anim .leaflet-tile{-webkit-transition:none;transition:none}',
+              '.leaflet-zoom-anim .leaflet-zoom-hide{visibility:hidden}',
+              '.leaflet-interactive{cursor:pointer}',
+              '.leaflet-grab{cursor:-webkit-grab;cursor:grab}',
+              '.leaflet-crosshair,.leaflet-crosshair .leaflet-interactive{cursor:crosshair}',
+              '.leaflet-popup-pane,.leaflet-control{cursor:auto}',
+              '.leaflet-dragging .leaflet-grab,.leaflet-dragging .leaflet-grab .leaflet-interactive,.leaflet-dragging .leaflet-marker-draggable{cursor:move;cursor:-webkit-grabbing;cursor:grabbing}',
+              '.leaflet-marker-icon,.leaflet-marker-shadow,.leaflet-image-layer,.leaflet-pane>svg path,.leaflet-tile-container{pointer-events:none}',
+              '.leaflet-marker-icon.leaflet-interactive,.leaflet-image-layer.leaflet-interactive,.leaflet-pane>svg path.leaflet-interactive,svg.leaflet-image-layer.leaflet-interactive path{pointer-events:auto}',
+              '.leaflet-container{background:#ddd;outline-offset:1px}',
+              '.leaflet-container a{color:#0078A8}',
+              '.leaflet-zoom-box{border:2px dotted #38f;background:rgba(255,255,255,.5)}',
+              '.leaflet-container{font-family:"Helvetica Neue",Arial,Helvetica,sans-serif;font-size:12px;line-height:1.5}',
+              '.leaflet-bar{box-shadow:0 1px 5px rgba(0,0,0,.65);border-radius:4px}',
+              '.leaflet-bar a{background-color:#fff;border-bottom:1px solid #ccc;width:26px;height:26px;line-height:26px;display:block;text-align:center;text-decoration:none;color:#000}',
+              '.leaflet-bar a:hover,.leaflet-bar a:focus{background-color:#f4f4f4}',
+              '.leaflet-bar a:first-child{border-top-left-radius:4px;border-top-right-radius:4px}',
+              '.leaflet-bar a:last-child{border-bottom-left-radius:4px;border-bottom-right-radius:4px;border-bottom:none}',
+              '.leaflet-bar a.leaflet-disabled{cursor:default;background-color:#f4f4f4;color:#bbb}',
+              '.leaflet-control-zoom-in,.leaflet-control-zoom-out{font:bold 18px "Lucida Console",Monaco,monospace;text-indent:1px}',
+              '.leaflet-control-layers{box-shadow:0 1px 5px rgba(0,0,0,.4);background:#fff;border-radius:5px}',
+              '.leaflet-control-layers-expanded{padding:6px 10px 6px 6px;color:#333;background:#fff}',
+              '.leaflet-control-layers label{display:block;font-size:13px}',
+              '.leaflet-container .leaflet-control-attribution{background:#fff;background:rgba(255,255,255,.8);margin:0}',
+              '.leaflet-control-attribution,.leaflet-control-scale-line{padding:0 5px;color:#333;line-height:1.4}',
+              '.leaflet-popup{position:absolute;text-align:center;margin-bottom:20px}',
+              '.leaflet-popup-content-wrapper{padding:1px;text-align:left;border-radius:12px}',
+              '.leaflet-popup-content{margin:13px 24px 13px 20px;line-height:1.3;font-size:13px;min-height:1px}',
+              '.leaflet-popup-content p{margin:1.3em 0}',
+              '.leaflet-popup-tip-container{width:40px;height:20px;position:absolute;left:50%;margin-left:-20px;overflow:hidden;pointer-events:none}',
+              '.leaflet-popup-tip{width:17px;height:17px;padding:1px;margin:-10px auto 0;pointer-events:auto;-webkit-transform:rotate(45deg);transform:rotate(45deg)}',
+              '.leaflet-popup-content-wrapper,.leaflet-popup-tip{background:#fff;color:#333;box-shadow:0 3px 14px rgba(0,0,0,.4)}',
+              '.leaflet-container a.leaflet-popup-close-button{position:absolute;top:0;right:0;border:none;text-align:center;width:24px;height:24px;font:16px/24px Tahoma,Verdana,sans-serif;color:#757575;text-decoration:none;background:transparent}',
+              '.leaflet-container a.leaflet-popup-close-button:hover,.leaflet-container a.leaflet-popup-close-button:focus{color:#585858}',
+              '.leaflet-popup-scrolled{overflow:auto}',
+              '.leaflet-tooltip{position:absolute;padding:6px;background-color:#fff;border:1px solid #fff;border-radius:3px;color:#222;white-space:nowrap;user-select:none;pointer-events:none;box-shadow:0 1px 3px rgba(0,0,0,.4)}',
+              '.leaflet-div-icon{background:#fff;border:1px solid #666}'
+            ].join('');
+            document.head.appendChild(st);
+          }
+
+          /* ── Aircraft SVG icon (same as aviation-tracker) ── */
+          function _makeIcon(heading, onGround, isAppr) {
+            var color = onGround ? '#d29922' : (isAppr ? '#f85149' : '#3fb950');
+            var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="-12 -12 24 24">' +
+              '<g transform="rotate(' + (heading || 0) + ')">' +
+              '<ellipse cx="0" cy="0" rx="2.2" ry="9" fill="' + color + '"/>' +
+              '<polygon points="0,-2 -10,4 0,2 10,4" fill="' + color + '" opacity="0.9"/>' +
+              '<polygon points="0,6 -4,10 4,10" fill="' + color + '" opacity="0.85"/>' +
+              '</g></svg>';
+            return L.divIcon({ html: svg, className: 'aircraft-icon', iconSize: [24,24], iconAnchor: [12,12], popupAnchor: [0,-14] });
+          }
+
+          /* ── Popup HTML ── */
+          function _popup(s) {
+            var call  = (s[1] || '').trim() || '—';
+            var alt   = s[7] != null ? Math.round(s[7]).toLocaleString() + ' m' : '—';
+            var vel   = s[9] != null ? Math.round(s[9] * 1.94384) + ' kt' : '—';
+            var hdg   = s[10] != null ? Math.round(s[10]) + '°' : '—';
+            var vrate = s[11] != null ? (s[11] > 0 ? '+' : '') + s[11].toFixed(1) + ' m/s' : '—';
+            var sta   = s[8] === false ? '🟢 In flight' : '🟡 On ground';
+            return '<div style="font-size:13px;font-weight:700;color:#58a6ff;margin-bottom:5px">' + call + '</div>' +
+              '<div style="display:flex;justify-content:space-between;gap:12px;margin:2px 0"><span style="color:#8b949e">Country</span><span style="font-weight:600">' + (s[2] || '?') + '</span></div>' +
+              '<div style="display:flex;justify-content:space-between;gap:12px;margin:2px 0"><span style="color:#8b949e">Altitude</span><span style="font-weight:600">' + alt + '</span></div>' +
+              '<div style="display:flex;justify-content:space-between;gap:12px;margin:2px 0"><span style="color:#8b949e">Speed</span><span style="font-weight:600">' + vel + '</span></div>' +
+              '<div style="display:flex;justify-content:space-between;gap:12px;margin:2px 0"><span style="color:#8b949e">Track</span><span style="font-weight:600">' + hdg + '</span></div>' +
+              '<div style="display:flex;justify-content:space-between;gap:12px;margin:2px 0"><span style="color:#8b949e">Vrate</span><span style="font-weight:600">' + vrate + '</span></div>' +
+              '<div style="display:flex;justify-content:space-between;gap:12px;margin:2px 0"><span style="color:#8b949e">Status</span><span style="font-weight:600">' + sta + '</span></div>';
+          }
+
+          /* ── Render map markers ── */
+          function _updateMap(states) {
+            var seen = {};
+            states.forEach(function(s) {
+              var lat = s[6], lon = s[5];
+              if (lat == null || lon == null) return;
+              var icao   = s[0];
+              var onGnd  = s[8] !== false;
+              var hdg    = s[10];
+              var isAppr = !onGnd && s[7] != null && s[7] < 914;
+              seen[icao] = true;
+              if (_trackerMarkers[icao]) {
+                _trackerMarkers[icao].setLatLng([lat, lon]);
+                _trackerMarkers[icao].setIcon(_makeIcon(hdg, onGnd, isAppr));
+                _trackerMarkers[icao].getPopup().setContent(_popup(s));
+              } else {
+                _trackerMarkers[icao] = L.marker([lat, lon], { icon: _makeIcon(hdg, onGnd, isAppr) })
+                  .bindPopup(_popup(s), { maxWidth: 240 })
+                  .addTo(_trackerMap);
+              }
+            });
+            Object.keys(_trackerMarkers).forEach(function(icao) {
+              if (!seen[icao]) { _trackerMap.removeLayer(_trackerMarkers[icao]); delete _trackerMarkers[icao]; }
+            });
+          }
+
+          /* ── Render table ── */
+          function _updateTable(states) {
+            var flying = states.filter(function(s){ return s[8] === false && s[7] != null; })
+                               .sort(function(a,b){ return (b[7]||0)-(a[7]||0); });
+            var ground = states.filter(function(s){ return s[8] !== false; });
+            var sorted = flying.concat(ground).slice(0, 80);
+            var tbody  = document.getElementById('tracker-tbody');
+            if (!sorted.length) {
+              tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:#8b949e;padding:20px">No aircraft in ORY area.</td></tr>';
+              return;
+            }
+            tbody.innerHTML = sorted.map(function(s, i) {
+              var call  = (s[1] || '').trim() || '—';
+              var alt   = s[7] != null ? Math.round(s[7]).toLocaleString() : '0';
+              var vr    = s[11] != null ? (s[11] > 0 ? '+' : '') + s[11].toFixed(1) : '–';
+              var vel   = s[9] != null  ? Math.round(s[9] * 1.94384) : '–';
+              var hdg   = s[10] != null ? Math.round(s[10]) : '–';
+              var onGnd = s[8] !== false;
+              var isAppr = !onGnd && s[7] != null && s[7] < 914;
+              var cls   = onGnd ? 't-gnd' : (isAppr ? 't-appr' : 't-fly');
+              var txt   = onGnd ? '🟡 GND' : (isAppr ? '🔴 APPR' : '🟢 FLY');
+              return '<tr data-icao="' + s[0] + '" data-lat="' + s[6] + '" data-lon="' + s[5] + '" data-haspos="' + (s[6]!=null&&s[5]!=null) + '">' +
+                '<td>' + (i+1) + '</td>' +
+                '<td><strong>' + call + '</strong></td>' +
+                '<td>' + (s[2] || '?').slice(0, 14) + '</td>' +
+                '<td>' + alt + '</td>' +
+                '<td>' + vr + '</td>' +
+                '<td>' + vel + '</td>' +
+                '<td>' + hdg + '</td>' +
+                '<td><span class="' + cls + '">' + txt + '</span></td>' +
+                '</tr>';
+            }).join('');
+            /* Row click → pan map + open popup */
+            tbody.querySelectorAll('tr[data-icao]').forEach(function(row) {
+              row.addEventListener('click', function() {
+                if (_trackerSelRow) _trackerSelRow.classList.remove('t-sel');
+                row.classList.add('t-sel');
+                _trackerSelRow = row;
+                if (row.dataset.haspos === 'true' && _trackerMarkers[row.dataset.icao]) {
+                  _trackerMap.setView([parseFloat(row.dataset.lat), parseFloat(row.dataset.lon)], Math.max(_trackerMap.getZoom(), 10), { animate: true });
+                  _trackerMarkers[row.dataset.icao].openPopup();
+                }
+              });
+            });
+          }
+
+          /* ── Update stats bar ── */
+          function _updateStats(states, fetched_at) {
+            var total  = states.length;
+            var flying = states.filter(function(s){ return s[8] === false; }).length;
+            var ground = total - flying;
+            var appr   = states.filter(function(s){ return s[8] === false && s[7] != null && s[7] < 914; }).length;
+            var el = function(id){ return document.getElementById(id); };
+            if (el('tr-total'))   el('tr-total').textContent   = total;
+            if (el('tr-flying'))  el('tr-flying').textContent  = flying;
+            if (el('tr-ground'))  el('tr-ground').textContent  = ground;
+            if (el('tr-appr'))    el('tr-appr').textContent    = appr;
+            if (el('tr-updated')) el('tr-updated').textContent = fetched_at || '–';
+          }
+
+          /* ── Poll /api/tracker ── */
+          function _pollTracker() {
+            fetch('/api/tracker')
+              .then(function(r){ return r.json(); })
+              .then(function(data) {
+                var errEl = document.getElementById('tracker-err');
+                if (data.error) {
+                  if (errEl) { errEl.style.display = 'block'; errEl.textContent = '⚠ ' + data.error; }
+                } else {
+                  if (errEl) errEl.style.display = 'none';
+                }
+                var states = data.states || [];
+                _updateMap(states);
+                _updateTable(states);
+                _updateStats(states, data.fetched_at);
+                var sb = document.getElementById('tracker-statusbar');
+                if (sb) sb.textContent = 'ORY box (48.10–49.15°N / 1.90–2.90°E) · ' + states.length + ' aircraft · updated ' + (data.fetched_at || '–') + ' · next in ~60 s';
+              })
+              .catch(function(e) {
+                var sb = document.getElementById('tracker-statusbar');
+                if (sb) sb.textContent = 'Error: ' + e.message;
+              });
+          }
+
+          /* ── Called once when user first opens the tracker tab ── */
+          window.trackerActivate = function() {
+            if (_trackerReady) {
+              /* Already initialised — just invalidate map size (tab was hidden) */
+              if (_trackerMap) setTimeout(function(){ _trackerMap.invalidateSize(); }, 50);
+              return;
+            }
+            _trackerReady = true;
+            _injectLeafletCSS();
+
+            if (typeof L !== 'undefined') {
+              _initMap();
+              return;
+            }
+
+            /* Leaflet not loaded — try dynamic injection.
+               Sources in priority order: aviation-tracker same-cluster, then unpkg. */
+            var LEAFLET_SOURCES = [
+              '/static/leaflet.js',
+              'https://aviation-tracker-test-app.apps-crc.testing/static/leaflet.js',
+              'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js'
+            ];
+            var _idx = 0;
+            function _tryNext() {
+              if (_idx >= LEAFLET_SOURCES.length) {
+                document.getElementById('tracker-map').innerHTML =
+                  '<div style="display:flex;align-items:center;justify-content:center;height:100%;' +
+                  'color:#8b949e;font-size:13px;flex-direction:column;gap:8px;padding:20px;text-align:center">' +
+                  '<span style="font-size:32px">🗺</span>' +
+                  '<span>Map unavailable (Leaflet could not be loaded).</span>' +
+                  '<span style="font-size:11px;color:#57606a">The flight table is still live — data refreshes every 60 s.</span>' +
+                  '</div>';
+                _pollTracker();
+                _trackerPollTimer = setInterval(_pollTracker, 60000);
+                return;
+              }
+              var sc = document.createElement('script');
+              sc.src = LEAFLET_SOURCES[_idx++];
+              sc.onload = function() { _initMap(); };
+              sc.onerror = function() { _tryNext(); };
+              document.head.appendChild(sc);
+            }
+            _tryNext();
+          };
+
+          function _initMap() {
+            var mapEl = document.getElementById('tracker-map');
+            if (!mapEl || _trackerMap) return;
+            _trackerMap = L.map('tracker-map', {
+              center: [48.7, 2.4],   /* ORY centroid */
+              zoom: 11
+            });
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+              attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+              maxZoom: 18
+            }).addTo(_trackerMap);
+
+            /* ORY bounding box overlay */
+            L.rectangle([[48.10, 1.90], [49.15, 2.90]], {
+              color: '#58a6ff', weight: 1.5, fillOpacity: 0.04, dashArray: '6,4'
+            }).addTo(_trackerMap).bindTooltip('ORY monitoring box', { permanent: false });
+
+            /* ORY airport marker */
+            L.marker([48.7233, 2.3794], {
+              icon: L.divIcon({
+                html: '<div style="background:#d29922;color:#0d1117;font-size:9px;font-weight:700;padding:2px 5px;border-radius:3px;white-space:nowrap;">ORY</div>',
+                className: '', iconAnchor: [14, 10]
+              })
+            }).addTo(_trackerMap).bindPopup('<strong style="color:#d29922">Paris-Orly Airport (ORY)</strong><br><span style="color:#8b949e;font-size:11px;">IATA: ORY · ICAO: LFPO</span>');
+
+            _pollTracker();
+            _trackerPollTimer = setInterval(_pollTracker, 60000);
+          }
+
+          /* ── If Leaflet was already loaded (e.g. page refresh), auto-detect ── */
+          document.addEventListener('DOMContentLoaded', function() {
+            /* Pre-check: Leaflet will be available if aviation-tracker injected it
+               in a shared session. Most likely it won't be — handled in trackerActivate(). */
+          });
+
+        })(); /* end IIFE */
       </script>
     </body>
     </html><!--HTML_END-->"""
