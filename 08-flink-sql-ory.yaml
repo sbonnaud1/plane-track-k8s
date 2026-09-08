@@ -1,0 +1,685 @@
+---
+# ConfigMap holding the complete Flink SQL CEP script for ORY.
+# The Job below submits it directly via sql-client.sh (no "embedded" keyword —
+# that mode was removed in Flink 1.17+).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: flink-sql-ory
+  namespace: plane-track
+data:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # CEP design for Paris-Orly (ORY) — two event patterns detected in real time:
+  #
+  # 1. MISSED APPROACH
+  #    An aircraft descends into the ORY final approach corridor (below 3000 ft /
+  #    914 m, ILS cone within ~10 NM) but then climbs away without touching down,
+  #    all within a 10-minute window.
+  #    Pattern:  APPROACH  →  CLIMBING  (no LANDED event in between)
+  #
+  # 2. TWIN LANDING (separation violation — short final)
+  #    Two aircraft on the SAME approach axis (RWY_06 or RWY_24) are both inside
+  #    the short-final zone (< 500 m) within the same 90-second HOP window.
+  #    Basis: ICAO Doc 4444 §6.7 — Dependent Parallel Approaches, ≥ 2 NM separation.
+  #
+  # Geometry constants for ORY runways 06L/24R and 06R/24L:
+  #   Airport reference:  48.7244°N  2.3797°E
+  #   Approach corridor:  baro_altitude < 914 m  AND  vertical_rate < 0 (descending)
+  #                       within the bounding box already used by the producer
+  #   Landing:            on_ground = TRUE
+  #   Go-around / climb:  vertical_rate > 2 m/s  AND  baro_altitude > 200 m
+  # ─────────────────────────────────────────────────────────────────────────────
+  init.sql: |
+    -- =========================================================================
+    -- 0. SETTINGS
+    -- =========================================================================
+    SET 'execution.checkpointing.interval' = '10s';
+    -- State TTL: 10 minutes (600 000 ms) — purges per-aircraft MATCH_RECOGNIZE state
+    SET 'table.exec.state.ttl' = '600000';
+    SET 'pipeline.name' = 'plane-track-ory-cep';
+
+    -- =========================================================================
+    -- 1. SOURCE TABLE — raw ADS-B stream from Kafka topic `adsb_raw`
+    --    Includes a proc_time column so static dimension lookups can use
+    --    processing-time temporal joins (insert-only → MATCH_RECOGNIZE-safe).
+    -- =========================================================================
+    CREATE TABLE IF NOT EXISTS adsb_raw (
+        icao24          STRING,
+        callsign        STRING,
+        origin_country  STRING,
+        time_position   BIGINT,
+        last_contact    BIGINT,
+        longitude       DOUBLE,
+        latitude        DOUBLE,
+        baro_altitude   DOUBLE,
+        on_ground       BOOLEAN,
+        velocity        DOUBLE,
+        true_track      DOUBLE,
+        vertical_rate   DOUBLE,
+        squawk          STRING,
+        spi             BOOLEAN,
+        position_source INT,
+        producer_ts     BIGINT,
+        event_time AS TO_TIMESTAMP_LTZ(producer_ts, 0),
+        WATERMARK FOR event_time AS event_time - INTERVAL '15' SECOND
+    ) WITH (
+        'connector'                     = 'kafka',
+        'topic'                         = 'adsb_raw',
+        'properties.bootstrap.servers'  = 'broker:29092',
+        'properties.group.id'           = 'flink-adsb-source',
+        'scan.startup.mode'             = 'latest-offset',
+        'format'                        = 'json',
+        'json.ignore-parse-errors'      = 'true'
+    );
+
+    -- =========================================================================
+    -- 2. ENRICHED VIEW — pass-through with normalised callsign.
+    --    Static CSV lookups (airline, route) are omitted here; the filesystem
+    --    connector does not support Flink lookup joins, so enrichment fields
+    --    default to sentinel values.  Alerts carry icao24 + callsign from the
+    --    live ADS-B stream, which is sufficient for the dashboard.
+    -- =========================================================================
+    CREATE VIEW adsb_enriched AS
+    SELECT
+        icao24,
+        COALESCE(TRIM(callsign), '??') AS callsign,
+        origin_country,
+        longitude,
+        latitude,
+        baro_altitude,
+        on_ground,
+        velocity,
+        true_track,
+        vertical_rate,
+        CAST('Unknown' AS STRING) AS airline,
+        CAST('???' AS STRING)     AS type_code,
+        CAST('' AS STRING)        AS registration,
+        CAST('' AS STRING)        AS route,
+        event_time
+    FROM adsb_raw;
+
+    -- =========================================================================
+    -- 3. APPROACH CORRIDOR FILTER
+    --    Aircraft inside the ORY ILS cone:
+    --      • baro_altitude < 914 m  (3 000 ft)
+    --      • within the producer bounding box (already pre-filtered by OpenSky)
+    --      • not yet on the ground
+    -- =========================================================================
+    CREATE VIEW ory_approach_events AS
+    SELECT *
+    FROM adsb_enriched
+    WHERE baro_altitude IS NOT NULL
+      AND baro_altitude < 914.0
+      AND on_ground = FALSE;
+
+    -- =========================================================================
+    -- 4. SINK TABLES
+    -- =========================================================================
+    CREATE TABLE IF NOT EXISTS ory_rapid_descent_sink (
+        icao24        STRING,
+        callsign      STRING,
+        baro_altitude DOUBLE,
+        vertical_rate DOUBLE,
+        latitude      DOUBLE,
+        longitude     DOUBLE,
+        detection_ts  TIMESTAMP(3)
+    ) WITH (
+        'connector'                    = 'kafka',
+        'topic'                        = 'ory_rapid_descent',
+        'properties.bootstrap.servers' = 'broker:29092',
+        'format'                       = 'json'
+    );
+
+    CREATE TABLE IF NOT EXISTS ory_corridor_overload_sink (
+        window_start   TIMESTAMP(3),
+        window_end     TIMESTAMP(3),
+        aircraft_count BIGINT,
+        detection_ts   TIMESTAMP(3)
+    ) WITH (
+        'connector'                    = 'kafka',
+        'topic'                        = 'ory_corridor_overload',
+        'properties.bootstrap.servers' = 'broker:29092',
+        'format'                       = 'json'
+    );
+
+    CREATE TABLE IF NOT EXISTS ory_repeated_goaround_sink (
+        icao24       STRING,
+        callsign     STRING,
+        goaround_1   TIMESTAMP(3),
+        goaround_2   TIMESTAMP(3),
+        detection_ts TIMESTAMP(3)
+    ) WITH (
+        'connector'                    = 'kafka',
+        'topic'                        = 'ory_repeated_goaround',
+        'properties.bootstrap.servers' = 'broker:29092',
+        'format'                       = 'json'
+    );
+
+    CREATE TABLE IF NOT EXISTS ory_missed_approach_sink (
+        icao24        STRING,
+        callsign      STRING,
+        airline       STRING,
+        type_code     STRING,
+        route         STRING,
+        approach_alt  DOUBLE,    -- altitude at start of approach
+        go_around_alt DOUBLE,    -- altitude when climb-out was detected
+        approach_ts   TIMESTAMP(3),
+        go_around_ts  TIMESTAMP(3),
+        detection_ts  TIMESTAMP(3)
+    ) WITH (
+        'connector'                     = 'kafka',
+        'topic'                         = 'ory_missed_approach',
+        'properties.bootstrap.servers'  = 'broker:29092',
+        'format'                        = 'json'
+    );
+
+    CREATE TABLE IF NOT EXISTS ory_twin_landing_sink (
+        window_start  TIMESTAMP(3),
+        window_end    TIMESTAMP(3),
+        icao24_a      STRING,
+        callsign_a    STRING,
+        icao24_b      STRING,
+        callsign_b    STRING,
+        alt_a         DOUBLE,
+        alt_b         DOUBLE,
+        detection_ts  TIMESTAMP(3)
+    ) WITH (
+        'connector'                     = 'kafka',
+        'topic'                         = 'ory_twin_landing',
+        'properties.bootstrap.servers'  = 'broker:29092',
+        'format'                        = 'json'
+    );
+
+    -- Source view for CEP chaining: read ory_missed_approach topic as input
+    -- Uses latest-offset (no group.id needed) so it tails new events only.
+    CREATE TABLE IF NOT EXISTS ory_missed_approach_src (
+        icao24        STRING,
+        callsign      STRING,
+        airline       STRING,
+        type_code     STRING,
+        route         STRING,
+        approach_alt  DOUBLE,
+        go_around_alt DOUBLE,
+        approach_ts   TIMESTAMP(3),
+        go_around_ts  TIMESTAMP(3),
+        detection_ts  TIMESTAMP(3),
+        event_time AS detection_ts,
+        WATERMARK FOR event_time AS event_time - INTERVAL '30' SECOND
+    ) WITH (
+        'connector'                     = 'kafka',
+        'topic'                         = 'ory_missed_approach',
+        'properties.bootstrap.servers'  = 'broker:29092',
+        'properties.group.id'           = 'flink-rga-source',
+        'scan.startup.mode'             = 'latest-offset',
+        'format'                        = 'json',
+        'json.ignore-parse-errors'      = 'true'
+    );
+
+    -- =========================================================================
+    -- 5 + 6.  CEP JOBS — each INSERT submitted as an individual SQL file.
+    --         The watchdog sidecar submits them sequentially (one sql-client.sh
+    --         invocation per file) to avoid the JVM OOM that a single monolithic
+    --         EXECUTE STATEMENT SET causes.  Each file redefines the required
+    --         tables/views because the Flink SQL client session is stateless.
+    -- =========================================================================
+  cep1_missed_approach.sql: |
+    SET 'execution.checkpointing.interval' = '10s';
+    SET 'table.exec.state.ttl' = '600000';
+    SET 'pipeline.name' = 'cep1-missed-approach';
+
+    -- adsb_raw source — proc_time added for processing-time lookup joins
+    CREATE TABLE IF NOT EXISTS adsb_raw (
+        icao24          STRING,
+        callsign        STRING,
+        origin_country  STRING,
+        time_position   BIGINT,
+        last_contact    BIGINT,
+        longitude       DOUBLE,
+        latitude        DOUBLE,
+        baro_altitude   DOUBLE,
+        on_ground       BOOLEAN,
+        velocity        DOUBLE,
+        true_track      DOUBLE,
+        vertical_rate   DOUBLE,
+        squawk          STRING,
+        spi             BOOLEAN,
+        position_source INT,
+        producer_ts     BIGINT,
+        event_time AS TO_TIMESTAMP_LTZ(producer_ts, 0),
+        WATERMARK FOR event_time AS event_time - INTERVAL '15' SECOND
+    ) WITH (
+        'connector'                     = 'kafka',
+        'topic'                         = 'adsb_raw',
+        'properties.bootstrap.servers'  = 'broker:29092',
+        'properties.group.id'           = 'flink-cep1-source',
+        'scan.startup.mode'             = 'latest-offset',
+        'format'                        = 'json',
+        'json.ignore-parse-errors'      = 'true'
+    );
+
+    CREATE TABLE IF NOT EXISTS ory_missed_approach_sink (
+        icao24        STRING,
+        callsign      STRING,
+        airline       STRING,
+        type_code     STRING,
+        route         STRING,
+        approach_alt  DOUBLE,
+        go_around_alt DOUBLE,
+        approach_ts   TIMESTAMP(3),
+        go_around_ts  TIMESTAMP(3),
+        detection_ts  TIMESTAMP(3)
+    ) WITH (
+        'connector'                     = 'kafka',
+        'topic'                         = 'ory_missed_approach',
+        'properties.bootstrap.servers'  = 'broker:29092',
+        'format'                        = 'json'
+    );
+
+    -- MATCH_RECOGNIZE must receive an append-only stream.
+    -- adsb_raw (Kafka) is append-only; we run the pattern directly on it.
+    -- The filesystem connector does not support lookup joins and post-match
+    -- LEFT JOINs make the output retract/update (rejected by Kafka sink).
+    -- airline/type_code/route are emitted as NULL — cosmetic fields not
+    -- required by the anomaly logic or the tests.
+    --
+    -- Orly bounding box: lat 48.68–48.77, lon 2.33–2.43
+    INSERT INTO ory_missed_approach_sink
+    SELECT
+        MR.icao24,
+        COALESCE(TRIM(MR.callsign), '??') AS callsign,
+        CAST(NULL AS STRING)              AS airline,
+        CAST(NULL AS STRING)              AS type_code,
+        CAST(NULL AS STRING)              AS route,
+        MR.approach_alt_m                 AS approach_alt,
+        MR.go_around_alt_m                AS go_around_alt,
+        MR.approach_ts,
+        MR.go_around_ts,
+        CURRENT_TIMESTAMP                 AS detection_ts
+    FROM (
+        SELECT *
+        FROM adsb_raw
+        WHERE baro_altitude IS NOT NULL
+          AND baro_altitude < 914.0
+          AND on_ground = FALSE
+          AND latitude  BETWEEN 48.68 AND 48.77
+          AND longitude BETWEEN 2.33  AND 2.43
+          AND velocity IS NOT NULL
+          AND velocity < 154.0
+    ) MATCH_RECOGNIZE (
+        PARTITION BY icao24
+        ORDER BY     event_time
+        MEASURES
+            A.baro_altitude       AS approach_alt_m,
+            A.callsign            AS callsign,
+            A.event_time          AS approach_ts,
+            LAST(C.baro_altitude) AS go_around_alt_m,
+            LAST(C.event_time)    AS go_around_ts
+        ONE ROW PER MATCH
+        AFTER MATCH SKIP PAST LAST ROW
+        PATTERN (A B* C+?) WITHIN INTERVAL '10' MINUTE
+        DEFINE
+            A AS A.baro_altitude < 914.0
+               AND A.on_ground = FALSE
+               AND A.vertical_rate < -1.0,
+            B AS B.on_ground = FALSE
+               AND B.baro_altitude < 914.0
+               AND B.vertical_rate <= 2.0,
+            C AS C.on_ground = FALSE
+               AND C.vertical_rate > 2.0
+               AND C.baro_altitude > 200.0
+    ) AS MR;
+  cep2_twin_landing.sql: |
+    SET 'execution.checkpointing.interval' = '10s';
+    SET 'table.exec.state.ttl' = '600000';
+    SET 'pipeline.name' = 'cep2-twin-landing';
+
+    -- =========================================================================
+    -- TWIN LANDING — Longitudinal Separation Violation
+    -- =========================================================================
+    -- Regulatory basis: ICAO Doc 4444 PANS-ATM §6.7, DSNA LoA Orly
+    --
+    -- Orly runway pairs 06L/06R and 24L/24R are spaced ~390 m — below the ICAO
+    -- 1 035 m threshold for Independent Parallel Approaches.  Orly therefore
+    -- operates Dependent Parallel Approaches: mandatory longitudinal separation
+    -- of ≥ 2 NM (3.7 km) between consecutive aircraft on the same approach axis,
+    -- equivalent to ≥ 80 s at standard approach speed (160 kt / 82 m/s).
+    --
+    -- Anomaly: two aircraft on the SAME runway axis are both inside the short-
+    -- final zone (< 500 m / ~1 640 ft) within the same 90-second window.
+    -- At 160 kt, the 500 m zone is only ~22 s deep; two aircraft both present
+    -- within 90 s means the gap between them is well under the 2 NM minimum.
+    --
+    -- Axis encoding (true_track ±25° of runway heading):
+    --   RWY_06 : true_track IN [35°, 85°]   — inbound heading ~060°
+    --   RWY_24 : true_track IN [215°, 265°]  — inbound heading ~240°
+    -- The join enforces approach_axis equality: normal simultaneous use of
+    -- opposite-direction runways never fires.
+    -- =========================================================================
+
+    CREATE TABLE IF NOT EXISTS adsb_raw (
+        icao24          STRING,
+        callsign        STRING,
+        origin_country  STRING,
+        time_position   BIGINT,
+        last_contact    BIGINT,
+        longitude       DOUBLE,
+        latitude        DOUBLE,
+        baro_altitude   DOUBLE,
+        on_ground       BOOLEAN,
+        velocity        DOUBLE,
+        true_track      DOUBLE,
+        vertical_rate   DOUBLE,
+        squawk          STRING,
+        spi             BOOLEAN,
+        position_source INT,
+        producer_ts     BIGINT,
+        event_time AS TO_TIMESTAMP_LTZ(producer_ts, 0),
+        WATERMARK FOR event_time AS event_time - INTERVAL '15' SECOND
+    ) WITH (
+        'connector'                     = 'kafka',
+        'topic'                         = 'adsb_raw',
+        'properties.bootstrap.servers'  = 'broker:29092',
+        'properties.group.id'           = 'flink-cep2-source',
+        'scan.startup.mode'             = 'latest-offset',
+        'format'                        = 'json',
+        'json.ignore-parse-errors'      = 'true'
+    );
+
+    CREATE TABLE IF NOT EXISTS ory_twin_landing_sink (
+        window_start  TIMESTAMP(3),
+        window_end    TIMESTAMP(3),
+        icao24_a      STRING,
+        callsign_a    STRING,
+        icao24_b      STRING,
+        callsign_b    STRING,
+        alt_a         DOUBLE,
+        alt_b         DOUBLE,
+        detection_ts  TIMESTAMP(3)
+    ) WITH (
+        'connector'                     = 'kafka',
+        'topic'                         = 'ory_twin_landing',
+        'properties.bootstrap.servers'  = 'broker:29092',
+        'format'                        = 'json'
+    );
+
+    -- Short-final view: altitude < 500 m, same axis, descending, inside bbox.
+    -- The CASE column encodes which runway axis the aircraft is on so the
+    -- self-join can require same-axis matching.
+    CREATE TEMPORARY VIEW ory_short_final AS
+    SELECT
+        icao24,
+        callsign,
+        baro_altitude,
+        event_time,
+        CASE
+            WHEN true_track BETWEEN 35.0 AND 85.0   THEN 'RWY_06'
+            WHEN true_track BETWEEN 215.0 AND 265.0 THEN 'RWY_24'
+        END AS approach_axis
+    FROM adsb_raw
+    WHERE baro_altitude IS NOT NULL
+      AND baro_altitude < 500.0
+      AND on_ground = FALSE
+      AND latitude  BETWEEN 48.68 AND 48.77
+      AND longitude BETWEEN 2.33  AND 2.43
+      AND velocity IS NOT NULL
+      AND velocity  < 154.0
+      AND vertical_rate IS NOT NULL
+      AND vertical_rate < 1.0
+      AND true_track IS NOT NULL
+      AND (
+            (true_track BETWEEN 35.0 AND 85.0)
+         OR (true_track BETWEEN 215.0 AND 265.0)
+      );
+
+    -- HOP(90 s, slide 10 s): two distinct aircraft on the SAME approach axis
+    -- both appearing in the same 90-second window → separation < 2 NM violation.
+    -- The sliding window means at most one alert per ~10 s overlap — duplicates
+    -- are suppressed by the dashboard dedup on (window_start, icao24_a, icao24_b).
+    INSERT INTO ory_twin_landing_sink
+    SELECT
+        a.window_start,
+        a.window_end,
+        a.icao24                         AS icao24_a,
+        COALESCE(TRIM(a.callsign), '??') AS callsign_a,
+        b.icao24                         AS icao24_b,
+        COALESCE(TRIM(b.callsign), '??') AS callsign_b,
+        a.avg_alt                        AS alt_a,
+        b.avg_alt                        AS alt_b,
+        CURRENT_TIMESTAMP                AS detection_ts
+    FROM (
+        SELECT
+            icao24,
+            MAX(callsign)      AS callsign,
+            AVG(baro_altitude) AS avg_alt,
+            approach_axis,
+            window_start,
+            window_end
+        FROM TABLE(
+            HOP(TABLE ory_short_final, DESCRIPTOR(event_time),
+                INTERVAL '10' SECOND, INTERVAL '90' SECOND)
+        )
+        GROUP BY icao24, approach_axis, window_start, window_end
+    ) a
+    JOIN (
+        SELECT
+            icao24,
+            MAX(callsign)      AS callsign,
+            AVG(baro_altitude) AS avg_alt,
+            approach_axis,
+            window_start,
+            window_end
+        FROM TABLE(
+            HOP(TABLE ory_short_final, DESCRIPTOR(event_time),
+                INTERVAL '10' SECOND, INTERVAL '90' SECOND)
+        )
+        GROUP BY icao24, approach_axis, window_start, window_end
+    ) b
+      ON  a.window_start  = b.window_start
+      AND a.window_end    = b.window_end
+      AND a.approach_axis = b.approach_axis
+      AND a.icao24        < b.icao24
+      AND ABS(a.avg_alt - b.avg_alt) < 200.0;
+  cep3_rapid_descent.sql: |
+    SET 'execution.checkpointing.interval' = '10s';
+    SET 'pipeline.name' = 'cep3-rapid-descent';
+
+    CREATE TABLE IF NOT EXISTS adsb_raw (
+        icao24          STRING,
+        callsign        STRING,
+        origin_country  STRING,
+        time_position   BIGINT,
+        last_contact    BIGINT,
+        longitude       DOUBLE,
+        latitude        DOUBLE,
+        baro_altitude   DOUBLE,
+        on_ground       BOOLEAN,
+        velocity        DOUBLE,
+        true_track      DOUBLE,
+        vertical_rate   DOUBLE,
+        squawk          STRING,
+        spi             BOOLEAN,
+        position_source INT,
+        producer_ts     BIGINT,
+        event_time AS TO_TIMESTAMP_LTZ(producer_ts, 0),
+        WATERMARK FOR event_time AS event_time - INTERVAL '15' SECOND
+    ) WITH (
+        'connector'                     = 'kafka',
+        'topic'                         = 'adsb_raw',
+        'properties.bootstrap.servers'  = 'broker:29092',
+        'properties.group.id'           = 'flink-cep3-source',
+        'scan.startup.mode'             = 'latest-offset',
+        'format'                        = 'json',
+        'json.ignore-parse-errors'      = 'true'
+    );
+
+    CREATE TABLE IF NOT EXISTS ory_rapid_descent_sink (
+        icao24        STRING,
+        callsign      STRING,
+        baro_altitude DOUBLE,
+        vertical_rate DOUBLE,
+        latitude      DOUBLE,
+        longitude     DOUBLE,
+        detection_ts  TIMESTAMP(3)
+    ) WITH (
+        'connector'                    = 'kafka',
+        'topic'                        = 'ory_rapid_descent',
+        'properties.bootstrap.servers' = 'broker:29092',
+        'format'                       = 'json'
+    );
+
+    -- Rapid Descent: streaming filter — any single message matching
+    --   baro_altitude < 2000 m  AND  vertical_rate < -18 m/s  AND  not on_ground
+    -- immediately produces one alert row.
+    -- Deduplication (same aircraft, 90-second cooldown) is handled by the dashboard
+    -- consumer so live data spikes do not flood the UI.
+    -- Threshold: -18 m/s ≈ 3 500 ft/min — well above normal approach descent rates.
+    INSERT INTO ory_rapid_descent_sink
+    SELECT
+        icao24,
+        COALESCE(TRIM(callsign), '??') AS callsign,
+        baro_altitude,
+        vertical_rate,
+        latitude,
+        longitude,
+        CURRENT_TIMESTAMP AS detection_ts
+    FROM adsb_raw
+    WHERE baro_altitude IS NOT NULL
+      AND baro_altitude < 2000.0
+      AND vertical_rate IS NOT NULL
+      AND vertical_rate < -18.0
+      AND on_ground = FALSE;
+  cep4_corridor_overload.sql: |
+    SET 'execution.checkpointing.interval' = '10s';
+    SET 'pipeline.name' = 'cep4-corridor-overload';
+
+    CREATE TABLE IF NOT EXISTS adsb_raw (
+        icao24          STRING,
+        callsign        STRING,
+        origin_country  STRING,
+        time_position   BIGINT,
+        last_contact    BIGINT,
+        longitude       DOUBLE,
+        latitude        DOUBLE,
+        baro_altitude   DOUBLE,
+        on_ground       BOOLEAN,
+        velocity        DOUBLE,
+        true_track      DOUBLE,
+        vertical_rate   DOUBLE,
+        squawk          STRING,
+        spi             BOOLEAN,
+        position_source INT,
+        producer_ts     BIGINT,
+        event_time AS TO_TIMESTAMP_LTZ(producer_ts, 0),
+        WATERMARK FOR event_time AS event_time - INTERVAL '15' SECOND
+    ) WITH (
+        'connector'                     = 'kafka',
+        'topic'                         = 'adsb_raw',
+        'properties.bootstrap.servers'  = 'broker:29092',
+        'properties.group.id'           = 'flink-cep4-source',
+        'scan.startup.mode'             = 'latest-offset',
+        'format'                        = 'json',
+        'json.ignore-parse-errors'      = 'true'
+    );
+
+    CREATE TABLE IF NOT EXISTS ory_corridor_overload_sink (
+        window_start   TIMESTAMP(3),
+        window_end     TIMESTAMP(3),
+        aircraft_count BIGINT,
+        detection_ts   TIMESTAMP(3)
+    ) WITH (
+        'connector'                    = 'kafka',
+        'topic'                        = 'ory_corridor_overload',
+        'properties.bootstrap.servers' = 'broker:29092',
+        'format'                       = 'json'
+    );
+
+    -- Named view required: Flink SQL 1.19 does not support TABLE(TUMBLE(TABLE(sub-select),...))
+    -- Same approach-heading filter as cep2: only genuine inbound traffic on RWY 06/24.
+    -- Threshold: 3 distinct aircraft in the approach corridor within a 30-second window.
+    -- Orly has 2 parallel runway pairs; 3 simultaneous aircraft in corridor = overload.
+    CREATE TEMPORARY VIEW ory_approach_cep4 AS
+    SELECT * FROM adsb_raw
+    WHERE baro_altitude IS NOT NULL
+      AND baro_altitude < 914.0
+      AND on_ground = FALSE
+      AND latitude  BETWEEN 48.68 AND 48.77
+      AND longitude BETWEEN 2.33  AND 2.43
+      AND velocity IS NOT NULL
+      AND velocity < 154.0
+      AND vertical_rate IS NOT NULL
+      AND vertical_rate < 2.0
+      AND true_track IS NOT NULL
+      AND (
+            (true_track BETWEEN 35.0 AND 85.0)
+         OR (true_track BETWEEN 215.0 AND 265.0)
+      );
+
+    INSERT INTO ory_corridor_overload_sink
+    SELECT
+        window_start,
+        window_end,
+        COUNT(DISTINCT icao24) AS aircraft_count,
+        CURRENT_TIMESTAMP      AS detection_ts
+    FROM TABLE(
+        TUMBLE(TABLE ory_approach_cep4, DESCRIPTOR(event_time), INTERVAL '30' SECOND)
+    )
+    GROUP BY window_start, window_end
+    HAVING COUNT(DISTINCT icao24) >= 3;
+  cep5_repeated_goaround.sql: |
+    SET 'execution.checkpointing.interval' = '10s';
+    SET 'table.exec.state.ttl' = '600000';
+    SET 'pipeline.name' = 'cep5-repeated-goaround';
+
+    CREATE TABLE IF NOT EXISTS ory_missed_approach_src (
+        icao24        STRING,
+        callsign      STRING,
+        airline       STRING,
+        type_code     STRING,
+        route         STRING,
+        approach_alt  DOUBLE,
+        go_around_alt DOUBLE,
+        approach_ts   TIMESTAMP(3),
+        go_around_ts  TIMESTAMP(3),
+        detection_ts  TIMESTAMP(3),
+        event_time AS detection_ts,
+        WATERMARK FOR event_time AS event_time - INTERVAL '30' SECOND
+    ) WITH (
+        'connector'                     = 'kafka',
+        'topic'                         = 'ory_missed_approach',
+        'properties.bootstrap.servers'  = 'broker:29092',
+        'properties.group.id'           = 'flink-cep5-rga-source',
+        'scan.startup.mode'             = 'latest-offset',
+        'format'                        = 'json',
+        'json.ignore-parse-errors'      = 'true'
+    );
+
+    CREATE TABLE IF NOT EXISTS ory_repeated_goaround_sink (
+        icao24       STRING,
+        callsign     STRING,
+        goaround_1   TIMESTAMP(3),
+        goaround_2   TIMESTAMP(3),
+        detection_ts TIMESTAMP(3)
+    ) WITH (
+        'connector'                    = 'kafka',
+        'topic'                        = 'ory_repeated_goaround',
+        'properties.bootstrap.servers' = 'broker:29092',
+        'format'                       = 'json'
+    );
+
+    INSERT INTO ory_repeated_goaround_sink
+    SELECT
+        a.icao24,
+        a.callsign,
+        a.detection_ts AS goaround_1,
+        b.detection_ts AS goaround_2,
+        CURRENT_TIMESTAMP AS detection_ts
+    FROM ory_missed_approach_src a
+    JOIN ory_missed_approach_src b
+      ON  a.icao24 = b.icao24
+      AND a.detection_ts < b.detection_ts
+      AND b.detection_ts BETWEEN a.detection_ts AND a.detection_ts + INTERVAL '30' MINUTE;
+# NOTE: flink-sql-init Job is DISABLED — CEP submission is handled exclusively
+# by the sql-resubmit-watchdog sidecar in the flink-jobmanager Deployment.
+# Running both simultaneously causes duplicate Flink jobs.
+# Uncomment only for manual one-shot recovery after a full cluster wipe.
+

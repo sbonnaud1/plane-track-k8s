@@ -1,0 +1,48 @@
+---
+# ServiceAccount used by every workload in the pipeline
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: plane-track-sa
+  namespace: plane-track
+---
+# Bind the SA to the OpenShift built-in "anyuid" SCC so pods can run as any UID
+# (required by apache/kafka and flink images that use arbitrary numeric UIDs).
+# The built-in anyuid SCC is sufficient — no custom SCC needed.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: plane-track-anyuid-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:openshift:scc:anyuid
+subjects:
+  - kind: ServiceAccount
+    name: plane-track-sa
+    namespace: plane-track
+---
+# Allow the dashboard to scale the adsb-simulator deployment (Start/Stop buttons).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: plane-track-scale
+  namespace: plane-track
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    verbs: ["get", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: plane-track-scale-binding
+  namespace: plane-track
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: plane-track-scale
+subjects:
+  - kind: ServiceAccount
+    name: plane-track-sa
+    namespace: plane-track

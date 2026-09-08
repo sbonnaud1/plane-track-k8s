@@ -1,0 +1,10 @@
+---
+# Namespace for the plane-track pipeline
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: plane-track
+  annotations:
+    openshift.io/display-name: "Plane Track — ORY CEP Pipeline"
+  labels:
+    app.kubernetes.io/part-of: plane-track

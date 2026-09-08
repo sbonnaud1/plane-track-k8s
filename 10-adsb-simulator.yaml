@@ -1,0 +1,473 @@
+---
+# ConfigMap: ADS-B simulator script
+# Injects synthetic events into `adsb_raw` to trigger all 5 CEP patterns:
+#
+#  MISSED APPROACH   — SIM001 descends into ORY corridor then climbs out (10-min window)
+#  TWIN LANDING      — SIM002+SIM003 on same axis both < 500 m within 90-second window
+#  RAPID DESCENT     — SIM004 below 2000 m at vrate < -18 m/s
+#  CORRIDOR OVERLOAD — SIM001+SIM002+SIM003 all in corridor in same 30-s window (≥3)
+#  REPEAT GO-AROUND  — fires automatically when MA repeats for same callsign within 30 min
+#
+# Rotation: MA → TW → RD → CO → MA → … every CYCLE_INTERVAL seconds.
+# Between scenarios: background cruise tick (SIM000) advances the Flink watermark.
+# Can coexist with the real adsb-producer (SIM* prefix is disjoint from real icao24s).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: adsb-simulator-script
+  namespace: plane-track
+data:
+  simulator.py: |
+    """
+    adsb-simulator / simulator.py
+    Publishes synthetic ADS-B events to `adsb_raw` to trigger the Flink CEP patterns.
+    Demo cadence (4-scenario rotation):
+      cycle 0: Missed Approach  (SIM001 only)
+      cycle 1: Twin Landing     (SIM002 + SIM003 only — no SIM001 overlap)
+      cycle 2: Rapid Descent    (SIM004 — steep vrate below 2000 m)
+      cycle 3: Corridor Overload(SIM001 + SIM002 + SIM003 simultaneously in corridor)
+      cycle 4: Missed Approach  ... and so on
+
+      Between scenarios a background cruise vector (SIM000, alt 8000 m) is sent
+      every BACKGROUND_INTERVAL seconds to advance the Flink watermark.
+
+      SIM001 is never active during a Twin Landing window, ensuring the TUMBLE
+      join produces exactly ONE pair per cycle (SIM002 × SIM003), not three.
+    """
+    import json
+    import os
+    import time
+    from kafka import KafkaProducer
+    from kafka.errors import NoBrokersAvailable
+
+    BOOTSTRAP           = os.environ.get("KAFKA_BOOTSTRAP", "broker:29092")
+    TOPIC               = os.environ.get("KAFKA_TOPIC",     "adsb_raw")
+    # Gap between end of one scenario and start of the next (seconds).
+    # MA emits for ~9 s, TW for ~15 s.  A gap of 20 s gives:
+    #   MA (9 s) + 20 s gap + TW (15 s) + 20 s gap = ~64 s per pair → ~1 MA + 1 TW / ~1 min.
+    CYCLE_INTERVAL      = int(os.environ.get("CYCLE_INTERVAL",      "20"))
+    BACKGROUND_INTERVAL = int(os.environ.get("BACKGROUND_INTERVAL", "5"))
+
+    ORY_LAT, ORY_LON = 48.7244, 2.3797
+
+    # ── Non-repeating callsign pools — shuffled independently for MA and TW ──
+    # MA and TW pools are fully disjoint (no shared callsign) so the same
+    # flight number never appears in both alert types.
+    # Each pool is large enough that repeats are very rare in normal demo use.
+    import random as _random
+
+    _MA_POOL = [
+        "AF6501",   # Air France   ORY–NCE
+        "AF7015",   # Air France   ORY–TLS
+        "AF7201",   # Air France   ORY–DUB
+        "AF6310",   # Air France   ORY–MRS
+        "AF6812",   # Air France   ORY–BOD
+        "HOP3728",  # HOP!         ORY–LYS
+        "HOP3614",  # HOP!         ORY–NTE
+        "HOP4102",  # HOP!         ORY–BOD
+        "HOP3541",  # HOP!         ORY–SXB
+        "TO5502",   # Transavia    ORY–LPA
+        "TO7124",   # Transavia    ORY–PMI
+        "TO2287",   # Transavia    ORY–AGP
+        "TO8831",   # Transavia    ORY–AGA
+        "U24815",   # easyJet      ORY–LGW
+        "U26031",   # easyJet      ORY–BRS
+        "U28714",   # easyJet      ORY–EDI
+        "IB3452",   # Iberia       ORY–MAD
+        "IB3615",   # Iberia       ORY–BCN
+        "VY8341",   # Vueling      ORY–BCN
+        "VY9102",   # Vueling      ORY–MAD
+    ]
+    _TW_POOL = [
+        ("TO3456",  "VLG8210"),  # Transavia ORY–AGP   /  Vueling ORY–BCN
+        ("AF6631",  "EZY1234"),  # Air France ORY–FCO  /  easyJet ORY–LGW
+        ("TO6821",  "BAW3456"),  # Transavia ORY–AMS   /  British Airways ORY–LHR
+        ("VLG8410", "KLM3456"),  # Vueling ORY–BCN     /  KLM ORY–AMS
+        ("AF9201",  "TO9934"),   # Air France ORY–LIS  /  Transavia ORY–FAO
+        ("IB3801",  "HOP5214"),  # Iberia ORY–MAD      /  HOP! ORY–LYS
+        ("U29018",  "VLG9321"),  # easyJet ORY–AMS     /  Vueling ORY–MAD
+        ("TO4417",  "AF8803"),   # Transavia ORY–PMI   /  Air France ORY–NTE
+        ("EZY2341", "IB4102"),   # easyJet ORY–BRS     /  Iberia ORY–BCN
+        ("BAW5612", "TO1198"),   # British Airways ORY–LHR / Transavia ORY–IBZ
+        ("KLM7231", "VLG6040"),  # KLM ORY–AMS         /  Vueling ORY–AGP
+        ("AF3317",  "U21845"),   # Air France ORY–TLS  /  easyJet ORY–EDI
+    ]
+
+    # Shuffled queues — refilled when exhausted so no callsign repeats until
+    # the whole pool has been used once (Fisher-Yates via random.shuffle).
+    _ma_queue  = []
+    _tw_queue  = []
+
+    def _next_ma_callsign():
+        global _ma_queue
+        if not _ma_queue:
+            _ma_queue = _MA_POOL[:]
+            _random.shuffle(_ma_queue)
+        return _ma_queue.pop()
+
+    def _next_tw_pair():
+        global _tw_queue
+        if not _tw_queue:
+            _tw_queue = _TW_POOL[:]
+            _random.shuffle(_tw_queue)
+        return _tw_queue.pop()
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+    def _msg(icao24, callsign, lat, lon, alt, on_ground, vrate, velocity=220.0, track=240.0):
+        ts = int(time.time())
+        return {
+            "icao24":          icao24,
+            "callsign":        callsign,
+            "origin_country":  "France",
+            "time_position":   ts,
+            "last_contact":    ts,
+            "longitude":       lon,
+            "latitude":        lat,
+            "baro_altitude":   alt,
+            "on_ground":       on_ground,
+            "velocity":        velocity,
+            "true_track":      track,
+            "vertical_rate":   vrate,
+            "squawk":          "1000",
+            "spi":             False,
+            "position_source": 0,
+            "producer_ts":     ts,
+        }
+
+    def _send(producer, msg):
+        producer.send(TOPIC, value=msg, key=msg["icao24"].encode())
+
+    def _wait_for_kafka(max_retries=30):
+        for attempt in range(1, max_retries + 1):
+            try:
+                p = KafkaProducer(
+                    bootstrap_servers=BOOTSTRAP,
+                    value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+                    acks=1,
+                    retries=3,
+                )
+                print(f"[simulator] Connected to Kafka at {BOOTSTRAP}", flush=True)
+                return p
+            except NoBrokersAvailable:
+                print(f"[simulator] Kafka not ready ({attempt}/{max_retries}) — retry in 5s", flush=True)
+                time.sleep(5)
+        raise RuntimeError("Cannot connect to Kafka")
+
+    # ── Scenario: MISSED APPROACH ─────────────────────────────────────────────
+    # SIM001 only.  Pattern A → B* → C+  within 10 min:
+    #   A: exactly ONE event — alt < 914 m, vrate < -1 m/s  (descending into corridor)
+    #      A single A-event ensures MATCH_RECOGNIZE fires exactly once per scenario.
+    #   B: alt < 914 m, vrate ≤  2 m/s  (continuing descent)
+    #   C: alt > 200 m, vrate >  2 m/s  (go-around climb)
+    #   EXIT: one event above 914 m so SIM001 is out of ory_approach_events
+    #         before the next TUMBLE window closes — prevents SIM001 from
+    #         contaminating the TW self-join and producing spurious pairs.
+    # Total active time: ~18 s (9 events × 2 s each)
+    #
+    # Each profile: (approach_alt_A, [B alts], [C alts])
+    # Rules: A < 914; B descending from A, all < 914; C[0] > 200, all vrate > 2.
+    # go_around_alt in the dashboard = LAST(C) = C[-1].
+    _MA_PROFILES = [
+        # (A_alt,  B_sequence,          C_sequence)
+        (820.0, [700, 600, 500],     [350, 500, 700, 900]),   # deep approach, high go-around
+        (680.0, [580, 480],          [310, 480, 660]),         # low approach, moderate climb
+        (870.0, [780, 680, 580],     [420, 620, 830]),         # very high entry, steep climb
+        (740.0, [640, 540, 440],     [280, 450, 680, 860]),    # standard profile
+        (600.0, [510, 420],          [250, 390, 560]),         # short finals, low go-around
+        (810.0, [720, 640, 560, 480],[380, 540, 720, 910]),    # long B sequence
+        (750.0, [650, 560],          [320, 510, 730]),         # mid-range
+        (530.0, [440, 360, 280],     [220, 360, 510, 680]),    # very low approach — critical
+        (890.0, [800, 710, 620],     [460, 660, 880]),         # near-ceiling entry
+        (660.0, [570, 480, 390],     [270, 430, 620, 800]),    # gradual descent, long climb
+    ]
+
+    def scenario_missed_approach(producer, cycle):
+        icao = "SIM001"
+        cs   = _next_ma_callsign()
+        alt_a, b_seq, c_seq = _MA_PROFILES[cycle % len(_MA_PROFILES)]
+        # lat/lon inside Orly TMA bbox [48.68–48.77, 2.33–2.43]
+        # true_track=60 → inbound RWY 06 heading; velocity 120 m/s ≈ 233 kt (on-finals speed)
+        lat, lon = ORY_LAT - 0.02, ORY_LON + 0.01
+        print(f"[simulator] >> MISSED APPROACH start  callsign={cs}  approach={alt_a}m  go-around={c_seq[-1]}m", flush=True)
+
+        # A — single anchoring event
+        _send(producer, _msg(icao, cs, lat, lon, alt_a, False, -4.0, 120.0, 60.0))
+        time.sleep(1)
+        for alt in b_seq:                                              # B
+            _send(producer, _msg(icao, cs, lat, lon, float(alt), False, -1.5, 110.0, 60.0))
+            time.sleep(1)
+        for alt in c_seq:                                              # C — go-around: track 240 (outbound)
+            _send(producer, _msg(icao, cs, lat, lon, float(alt), False,  5.0, 120.0, 240.0))
+            time.sleep(1)
+        # EXIT — push SIM001 well above the approach corridor (on_ground=False, alt > 914 m)
+        # so it no longer satisfies ory_approach_events and cannot pollute TW windows.
+        _send(producer, _msg(icao, cs, lat, lon, 2000.0, False, 5.0, 130.0, 240.0))
+
+        producer.flush()
+        print("[simulator] >> MISSED APPROACH complete", flush=True)
+
+    # ── Scenario: TWIN LANDING ────────────────────────────────────────────────
+    # Regulatory basis: ICAO Doc 4444 §6.7 — Dependent Parallel Approaches.
+    # Orly RWY spacing ~390 m → mandatory ≥ 2 NM (80 s) longitudinal separation.
+    # Anomaly simulated: SIM002 and SIM003 both on RWY_06 axis (true_track=60°),
+    # both inside the short-final zone (< 500 m), within the same 90-second window.
+    #
+    # CEP2 now uses HOP(90 s, slide 10 s) with approach_axis join — so both
+    # aircraft must be on the SAME axis AND below 500 m simultaneously.
+    #
+    # Simulator design to produce exactly 1 alert and no flood:
+    #   • All altitudes strictly < 500 m and > 50 m
+    #   • Vertical separation between pairs < 200 m (CEP join condition)
+    #   • Both aircraft: true_track=60 (RWY_06), velocity=120 m/s, vrate=-3 m/s
+    #   • 5 interleaved steps × 1.5 s = ~7.5 s active → fits cleanly in one 90 s window
+    #   • EXIT events push both above 500 m so they leave the short-final view
+    #     before the next HOP window is computed — no second alert
+    #
+    # Each profile: (alts_SIM002[5], alts_SIM003[5])
+    # Rules: all < 500, all > 50; |avg_a - avg_b| < 200 m
+    _TW_PROFILES = [
+        # ( alts_SIM002,              alts_SIM003 )        # avg_sep
+        ([460, 420, 380, 340, 300], [390, 360, 330, 300, 270]),  #  ~75 m
+        ([480, 440, 400, 360, 320], [430, 400, 370, 340, 310]),  #  ~60 m
+        ([450, 410, 370, 330, 290], [350, 320, 290, 260, 230]),  # ~110 m
+        ([470, 430, 390, 350, 310], [410, 380, 350, 320, 290]),  #  ~70 m
+        ([490, 460, 430, 400, 370], [460, 440, 420, 400, 380]),  #  ~25 m
+        ([440, 400, 360, 320, 280], [370, 340, 310, 280, 250]),  #  ~80 m
+    ]
+
+    def scenario_twin_landing(producer, cycle):
+        # Both aircraft inside Orly bbox [48.68–48.77, 2.33–2.43].
+        # Same true_track=60 → RWY_06 axis. Small position offsets simulate
+        # two aircraft on parallel tracks of the same approach path.
+        lat, lon = ORY_LAT - 0.02, ORY_LON + 0.01
+        cs_a, cs_b = _next_tw_pair()
+        alts_a, alts_b = _TW_PROFILES[cycle % len(_TW_PROFILES)]
+        avg_a = sum(alts_a) / len(alts_a)
+        avg_b = sum(alts_b) / len(alts_b)
+        print(f"[simulator] >> TWIN LANDING start  A={cs_a}({avg_a:.0f}m) B={cs_b}({avg_b:.0f}m)  sep={abs(avg_a-avg_b):.0f}m", flush=True)
+        # Interleaved steps — both aircraft in short-final simultaneously
+        steps = [
+            ("SIM002", cs_a, lat,         lon,         float(alts_a[0])),
+            ("SIM003", cs_b, lat + 0.002, lon + 0.001, float(alts_b[0])),
+            ("SIM002", cs_a, lat - 0.002, lon - 0.001, float(alts_a[1])),
+            ("SIM003", cs_b, lat + 0.002, lon + 0.001, float(alts_b[1])),
+            ("SIM002", cs_a, lat - 0.003, lon - 0.001, float(alts_a[2])),
+            ("SIM003", cs_b, lat + 0.002, lon + 0.001, float(alts_b[2])),
+            ("SIM002", cs_a, lat - 0.004, lon - 0.002, float(alts_a[3])),
+            ("SIM003", cs_b, lat + 0.002, lon + 0.001, float(alts_b[3])),
+            ("SIM002", cs_a, lat - 0.005, lon - 0.002, float(alts_a[4])),
+            ("SIM003", cs_b, lat + 0.002, lon + 0.001, float(alts_b[4])),
+        ]
+        for icao, cs, la, lo, alt in steps:
+            _send(producer, _msg(icao, cs, la, lo, alt, False, -3.0, 120.0, 60.0))
+            time.sleep(1.5)
+        # EXIT: push both above 500 m so they leave ory_short_final view
+        # before the next HOP window is computed → no second alert
+        _send(producer, _msg("SIM002", cs_a, lat, lon, 600.0, False, 5.0, 120.0, 240.0))
+        _send(producer, _msg("SIM003", cs_b, lat, lon, 600.0, False, 5.0, 120.0, 240.0))
+
+        # WATERMARK NUDGE — advance Flink watermark past the 90-second HOP window.
+        # ory_short_final filters to baro_altitude < 500 m, so the normal SIM000
+        # background tick at 8 000 m never reaches that view and the watermark for
+        # CEP2's HOP windows would stall, preventing them from ever closing.
+        #
+        # SIMWM1 uses true_track=90° — intentionally outside both runway axis bands
+        # ([35–85] for RWY_06 and [215–265] for RWY_24).  This means it is filtered
+        # out by the axis condition in ory_short_final and never enters the HOP
+        # self-join, so it cannot form a false pair with SIM002 or SIM003.
+        # It still reaches adsb_raw, which is the watermark source — so 10 ticks
+        # × 1 s push event_time ≥ 95 s beyond scenario start, enough for the
+        # watermark (event_time − 15 s) to clear the 90-second window boundary.
+        print("[simulator] >> TW watermark nudge ...", flush=True)
+        for i in range(10):
+            _send(producer, _msg("SIMWM1", "SIMWM1", lat - 0.001 * i, lon, 490.0,
+                                 False, -0.5, 120.0, 90.0))   # track=90° → outside axis bands
+            time.sleep(1)
+
+        producer.flush()
+        print("[simulator] >> TWIN LANDING complete", flush=True)
+
+    # ── Scenario: RAPID DESCENT ───────────────────────────────────────────────
+    # SIM004 only.  One aircraft below 2000 m descends at < -18 m/s (CEP3 threshold).
+    # Emits a short burst of 5 events, each 1 s apart, with steep vrate.
+    # Multiple events are emitted so Flink (filter query) definitely sees at
+    # least one matching row even under watermark lag.
+    # Total active time: ~5 s
+    _RD_PROFILES = [
+        # (alt_m,  vrate_m_s)   — all must be < 2000 m and vrate < -18 (CEP3 threshold)
+        (1500.0, -18.5),
+        (1200.0, -22.0),
+        ( 800.0, -26.0),
+        (1800.0, -19.0),
+        ( 600.0, -30.0),
+        (1400.0, -19.0),
+        ( 950.0, -24.0),
+        (1650.0, -18.5),
+    ]
+
+    def scenario_rapid_descent(producer, cycle):
+        icao = "SIM004"
+        cs   = "SIM004RD"
+        alt, vrate = _RD_PROFILES[cycle % len(_RD_PROFILES)]
+        # Inside Orly bbox but NOT in the approach heading bands → not confused with cep1/cep2.
+        # Heading ~000° (northbound) — outside the 06/24 corridor.
+        lat, lon = ORY_LAT + 0.02, ORY_LON + 0.01
+        print(f"[simulator] >> RAPID DESCENT start  alt={alt}m  vrate={vrate}m/s", flush=True)
+        for i in range(5):
+            _send(producer, _msg(icao, cs, lat + i * 0.001, lon, alt - i * 30.0, False, vrate, 130.0, 0.0))
+            time.sleep(1)
+        # EXIT — climb SIM004 well above 2000 m
+        _send(producer, _msg(icao, cs, lat, lon, 3500.0, False, 5.0, 130.0, 0.0))
+        producer.flush()
+        print("[simulator] >> RAPID DESCENT complete", flush=True)
+
+    # ── Scenario: CORRIDOR OVERLOAD ───────────────────────────────────────────
+    # SIM001 + SIM002 + SIM003 simultaneously inside corridor (alt < 914 m).
+    # All three must appear within the SAME 30-second TUMBLE window.
+    # CEP4 threshold: COUNT(DISTINCT icao24) >= 3 → exactly met by this scenario.
+    # SIM001 stays level (vrate ≈ 0) to avoid triggering a MA pattern.
+    # Total active time: ~18 s (4 steps × 3 aircraft × 1.5 s) — fits in 30 s window.
+    _CO_ALTS = [
+        (750.0, 680.0, 820.0),
+        (820.0, 760.0, 700.0),
+        (600.0, 650.0, 730.0),
+        (880.0, 810.0, 770.0),
+    ]
+
+    def scenario_corridor_overload(producer, cycle):
+        # Inside Orly bbox; true_track=240 → inbound RWY 24; velocity 120 m/s ≈ 233 kt
+        lat, lon = ORY_LAT - 0.02, ORY_LON + 0.01
+        a1, a2, a3 = _CO_ALTS[cycle % len(_CO_ALTS)]
+        print(f"[simulator] >> CORRIDOR OVERLOAD start  alts=({a1},{a2},{a3})m", flush=True)
+        for step in range(4):
+            _send(producer, _msg("SIM001", "SIMCO01", lat,          lon,          a1 - step*15, False, -0.5, 120.0, 240.0))
+            time.sleep(0.5)
+            _send(producer, _msg("SIM002", "SIMCO02", lat - 0.003,  lon + 0.003,  a2 - step*15, False, -1.0, 115.0, 240.0))
+            time.sleep(0.5)
+            _send(producer, _msg("SIM003", "SIMCO03", lat + 0.003,  lon - 0.003,  a3 - step*15, False, -0.8, 110.0, 240.0))
+            time.sleep(0.5)
+        # EXIT all three above corridor
+        for icao, cs in [("SIM001","SIMCO01"),("SIM002","SIMCO02"),("SIM003","SIMCO03")]:
+            _send(producer, _msg(icao, cs, lat, lon, 2000.0, False, 5.0, 120.0, 240.0))
+        producer.flush()
+        print("[simulator] >> CORRIDOR OVERLOAD complete", flush=True)
+
+    # ── Background ticks — advance Flink watermark between scenarios ──────────
+    def background_tick(producer):
+        msg = _msg("SIM000", "SIMBG00", ORY_LAT + 0.2, ORY_LON - 0.1,
+                   8000.0, False, 0.0, 250.0, 90.0)
+        _send(producer, msg)
+        producer.flush()
+
+    # ── Main — 4-scenario rotation ────────────────────────────────────────────
+    _SCENARIOS = ["MA", "TW", "RD", "CO"]
+
+    def main():
+        producer   = _wait_for_kafka()
+        cycle      = 0               # indexes into _SCENARIOS cyclically
+        # Fire first scenario immediately on startup (last_cycle set to epoch 0).
+        last_cycle = 0
+        last_bg    = time.time()
+
+        print(f"[simulator] Running — 4-scenario rotation (MA/TW/RD/CO) every {CYCLE_INTERVAL}s, "
+              f"BG tick every {BACKGROUND_INTERVAL}s", flush=True)
+
+        while True:
+            now = time.time()
+
+            if now - last_bg >= BACKGROUND_INTERVAL:
+                background_tick(producer)
+                last_bg = now
+
+            if now - last_cycle >= CYCLE_INTERVAL:
+                kind = _SCENARIOS[cycle % len(_SCENARIOS)]
+                sub  = cycle // len(_SCENARIOS)
+                if kind == "MA":
+                    scenario_missed_approach(producer, sub)
+                elif kind == "TW":
+                    scenario_twin_landing(producer, sub)
+                elif kind == "RD":
+                    scenario_rapid_descent(producer, sub)
+                elif kind == "CO":
+                    scenario_corridor_overload(producer, sub)
+                cycle     += 1
+                last_cycle = time.time()
+
+            time.sleep(1)
+
+    if __name__ == "__main__":
+        main()
+---
+# Deployment — runs the simulator alongside the real producer
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: adsb-simulator
+  namespace: plane-track
+  labels:
+    app: adsb-simulator
+    app.kubernetes.io/part-of: plane-track
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: adsb-simulator
+  template:
+    metadata:
+      labels:
+        app: adsb-simulator
+    spec:
+      serviceAccountName: plane-track-sa
+      initContainers:
+        - name: pip-install
+          image: docker.io/python:3.12-slim
+          command:
+            - /bin/sh
+            - -c
+            - |
+              pip install --quiet --no-cache-dir kafka-python-ng --target /deps
+              # Remove the legacy 'kafka' stub if it was pulled as a dependency,
+              # but preserve kafka_python_ng's own 'kafka/' package directory.
+              rm -rf /deps/kafka-[0-9]*.dist-info 2>/dev/null || true
+              echo "deps ready"
+          volumeMounts:
+            - name: deps
+              mountPath: /deps
+      containers:
+        - name: simulator
+          image: docker.io/python:3.12-slim
+          command:
+            - /bin/sh
+            - -c
+            - |
+              export PYTHONPATH=/deps
+              python /scripts/simulator.py
+          env:
+            - name: KAFKA_BOOTSTRAP
+              value: "broker:29092"
+            - name: KAFKA_TOPIC
+              value: "adsb_raw"
+            # Gap (seconds) between end of one scenario and start of the next.
+            # MA runs ~9 s, TW runs ~15 s; a 20 s gap gives ~1 MA + 1 TW / ~1 min.
+            - name: CYCLE_INTERVAL
+              value: "20"
+            - name: BACKGROUND_INTERVAL
+              value: "5"
+          resources:
+            requests:
+              memory: "32Mi"
+              cpu: "20m"
+            limits:
+              memory: "128Mi"
+              cpu: "100m"
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+            - name: deps
+              mountPath: /deps
+      volumes:
+        - name: scripts
+          configMap:
+            name: adsb-simulator-script
+        - name: deps
+          emptyDir: {}

@@ -1,0 +1,67 @@
+---
+# Init Job — waits for the broker to be ready on port 29092 (PLAINTEXT listener),
+# then creates all required topics. Runs once; OpenShift will not restart a completed Job.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kafka-topics-init
+  namespace: plane-track
+  labels:
+    app.kubernetes.io/part-of: plane-track
+spec:
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 5
+  template:
+    spec:
+      serviceAccountName: plane-track-sa
+      restartPolicy: OnFailure
+      initContainers:
+        # Wait until the broker is actually accepting connections on port 29092
+        - name: wait-for-broker
+          image: docker.io/apache/kafka:3.7.0
+          command:
+            - /bin/bash
+            - -c
+            - |
+              echo "Waiting for broker:9092 ..."
+              until /opt/kafka/bin/kafka-topics.sh --bootstrap-server broker:29092 --list > /dev/null 2>&1; do
+                sleep 3
+              done
+              echo "Broker is ready."
+      containers:
+        - name: topic-creator
+          image: docker.io/apache/kafka:3.7.0
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              BS="broker:29092"
+
+              create_topic() {
+                local name=$1 parts=$2 ret=$3 retention_ms=$4
+                if /opt/kafka/bin/kafka-topics.sh --bootstrap-server $BS --list | grep -qx "$name"; then
+                  echo "Topic $name already exists — skipping."
+                else
+                  /opt/kafka/bin/kafka-topics.sh --bootstrap-server $BS \
+                    --create --topic "$name" \
+                    --partitions "$parts" \
+                    --replication-factor "$ret" \
+                    --config retention.ms="$retention_ms"
+                  echo "Created topic: $name (retention=${retention_ms}ms)"
+                fi
+              }
+
+              # Raw ADS-B position updates — keep 1 hour
+              create_topic adsb_raw                4 1 3600000
+
+              # CEP outputs — keep 2 hours so dashboard replays on restart
+              create_topic ory_missed_approach     1 1 7200000
+              create_topic ory_twin_landing        1 1 7200000
+              create_topic ory_repeated_goaround   1 1 7200000
+              create_topic ory_rapid_descent       1 1 7200000
+              create_topic ory_corridor_overload   1 1 7200000
+
+              echo "All topics ready."
+
+

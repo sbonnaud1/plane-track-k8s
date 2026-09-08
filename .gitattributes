@@ -1,0 +1,19 @@
+# Default: auto line endings
+* text=auto
+
+# Shell scripts — always LF (executed on Linux/CRC)
+*.sh text eol=lf
+
+# Python — always LF
+*.py text eol=lf
+
+# YAML and Markdown — auto
+*.yaml text eol=lf
+*.yml  text eol=lf
+*.md   text eol=lf
+
+# CSV
+*.csv text eol=lf
+
+# Binary
+*.docx binary

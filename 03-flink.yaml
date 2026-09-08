@@ -1,0 +1,206 @@
+---
+# Flink JobManager
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flink-jobmanager
+  namespace: plane-track
+  labels:
+    app: flink-jobmanager
+    app.kubernetes.io/part-of: plane-track
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: flink-jobmanager
+  template:
+    metadata:
+      labels:
+        app: flink-jobmanager
+    spec:
+      serviceAccountName: plane-track-sa
+      containers:
+        - name: flink-jobmanager
+          image: docker.io/cnfldemos/flink-kafka:1.19.1-scala_2.12-java17
+          command: ["/docker-entrypoint.sh", "jobmanager"]
+          env:
+            - name: FLINK_PROPERTIES
+              value: |
+                jobmanager.rpc.address: flink-jobmanager
+                rest.bind-port: 9081
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
+          ports:
+            - containerPort: 9081
+            - containerPort: 6123
+          volumeMounts:
+            - name: data-csv
+              mountPath: /data_csv
+        # ── Auto-resubmit sidecar ──────────────────────────────────────────
+        # Polls the JobManager REST API every 5 min. When fewer than 5 RUNNING
+        # jobs are found (e.g. after a TaskManager restart), it submits each
+        # CEP SQL file individually via sql-client.sh to avoid JVM OOM.
+        # Each file is self-contained (defines its own tables) so sessions
+        # are independent and peak memory per invocation stays low (~300 Mi).
+        - name: sql-resubmit-watchdog
+          image: docker.io/cnfldemos/flink-sql-client-kafka:1.19.1-scala_2.12-java17
+          command:
+            - /bin/bash
+            - -c
+            - |
+              export FLINK_CONF_DIR=/opt/flink/conf
+              echo "[watchdog] Starting — will submit 5 CEP jobs sequentially"
+              # Wait for JobManager REST to come up before first check
+              until curl -sf http://localhost:9081/overview > /dev/null 2>&1; do
+                echo "[watchdog] Waiting for JobManager REST API..."
+                sleep 5
+              done
+              echo "[watchdog] JobManager ready — waiting 3 min before first submission"
+              sleep 180
+              while true; do
+                # Count unique running job names (not raw count) to avoid false re-submissions
+                # caused by duplicate jobs from a previous cycle still canceling.
+                JOBS_JSON=$(curl -sf http://localhost:9081/jobs/overview 2>/dev/null || echo '{"jobs":[]}')
+                RUNNING=$(echo "$JOBS_JSON" \
+                          | grep -o '"state":"RUNNING"' | wc -l | tr -d '[:space:]' || echo 0)
+                # Count unique names of RUNNING jobs to detect duplicates
+                UNIQUE=$(echo "$JOBS_JSON" \
+                         | grep -o '"name":"[^"]*"' | sort -u | wc -l | tr -d '[:space:]' || echo 0)
+                RUNNING=$(echo "$RUNNING" | tr -d '[:space:]')
+                echo "[watchdog] RUNNING jobs: $RUNNING (unique names: $UNIQUE)"
+                if [ "${RUNNING:-0}" -lt 5 ] || [ "${UNIQUE:-0}" -lt 5 ]; then
+                  echo "[watchdog] Only $RUNNING/5 jobs running — submitting all CEP files..."
+                  for f in /sql/cep1_missed_approach.sql \
+                            /sql/cep2_twin_landing.sql \
+                            /sql/cep3_rapid_descent.sql \
+                            /sql/cep4_corridor_overload.sql \
+                            /sql/cep5_repeated_goaround.sql; do
+                    echo "[watchdog] Submitting $f ..."
+                    /opt/flink/bin/sql-client.sh --file "$f" \
+                      && echo "[watchdog] OK: $f" \
+                      || echo "[watchdog] FAILED: $f (will retry next cycle)"
+                    sleep 10
+                  done
+                  echo "[watchdog] All CEP files submitted — sleeping 5 min"
+                else
+                  echo "[watchdog] All 5 jobs RUNNING — OK"
+                fi
+                sleep 300
+              done
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "512Mi"
+              cpu: "300m"
+          volumeMounts:
+            - name: sql-script
+              mountPath: /sql
+            - name: data-csv
+              mountPath: /data_csv
+      volumes:
+        - name: data-csv
+          configMap:
+            name: data-csv
+        - name: sql-script
+          configMap:
+            name: flink-sql-ory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: flink-jobmanager
+  namespace: plane-track
+spec:
+  selector:
+    app: flink-jobmanager
+  ports:
+    - name: rest
+      port: 9081
+      targetPort: 9081
+    - name: rpc
+      port: 6123
+      targetPort: 6123
+    - name: blob
+      port: 6124
+      targetPort: 6124
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: flink-ui
+  namespace: plane-track
+spec:
+  to:
+    kind: Service
+    name: flink-jobmanager
+  port:
+    targetPort: rest
+  tls:
+    termination: edge
+---
+# Flink TaskManager
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flink-taskmanager
+  namespace: plane-track
+  labels:
+    app: flink-taskmanager
+    app.kubernetes.io/part-of: plane-track
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: flink-taskmanager
+  template:
+    metadata:
+      labels:
+        app: flink-taskmanager
+    spec:
+      serviceAccountName: plane-track-sa
+      containers:
+        - name: flink-taskmanager
+          image: docker.io/cnfldemos/flink-kafka:1.19.1-scala_2.12-java17
+          command: ["/docker-entrypoint.sh", "taskmanager"]
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: FLINK_PROPERTIES
+              value: |
+                jobmanager.rpc.address: flink-jobmanager
+                taskmanager.numberOfTaskSlots: 10
+                taskmanager.registration.timeout: 5 min
+                heartbeat.timeout: 120000
+                heartbeat.interval: 10000
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "200m"
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
+          ports:
+            - containerPort: 6121
+            - containerPort: 6122
+            - containerPort: 6124
+          volumeMounts:
+            - name: data-csv
+              mountPath: /data_csv
+      volumes:
+        - name: data-csv
+          configMap:
+            name: data-csv
+# Note: the flink-sql-client Deployment (sleep infinity) has been removed.
+# SQL submission is handled exclusively by the sql-resubmit-watchdog sidecar
+# in the flink-jobmanager Deployment above (see 03-flink.yaml lines 52-96).

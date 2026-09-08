@@ -1,0 +1,257 @@
+---
+# ConfigMap containing the ADS-B producer Python script.
+# The Deployment below mounts it and runs it directly — no image build needed.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: adsb-producer-script
+  namespace: plane-track
+data:
+  producer.py: |
+    """
+    adsb-producer / producer.py
+    Polls the OpenSky Network API (v2, OAuth2 client credentials) every
+    POLL_INTERVAL seconds for the ORY approach bounding box, then publishes
+    each ADS-B state vector as a JSON message to the Kafka topic `adsb_raw`.
+
+    Authentication: OpenSky v2 uses OAuth2 client_credentials flow.
+      TOKEN_URL   = https://opensky-network.org/api/auth/token
+      Credentials : OPENSKY_CLIENT_ID / OPENSKY_CLIENT_SECRET (env vars)
+    The TokenManager handles transparent token refresh (expires_in - 30s margin).
+
+    Bounding box for Orly (ORY) ± 50 NM:
+      lat 48.10 – 49.15   lon 1.90 – 2.90
+    """
+    import json
+    import os
+    import time
+    from datetime import datetime, timedelta
+
+    import requests
+    from kafka import KafkaProducer
+    from kafka.errors import NoBrokersAvailable
+
+    # ── Configuration (all overridable via env) ──────────────────────────────
+    BOOTSTRAP     = os.environ.get("KAFKA_BOOTSTRAP", "broker:29092")
+    TOPIC         = os.environ.get("KAFKA_TOPIC",     "adsb_raw")
+    POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "60"))
+
+    # Orly approach box (±50 NM around 48.7244°N 2.3797°E)
+    LAMIN = float(os.environ.get("LAMIN", "48.10"))
+    LOMIN = float(os.environ.get("LOMIN", "1.90"))
+    LAMAX = float(os.environ.get("LAMAX", "49.15"))
+    LOMAX = float(os.environ.get("LOMAX", "2.90"))
+
+    # OpenSky OAuth2 client credentials (v2 API — no more Basic Auth)
+    CLIENT_ID     = os.environ.get("OPENSKY_CLIENT_ID",     "")
+    CLIENT_SECRET = os.environ.get("OPENSKY_CLIENT_SECRET", "")
+    TOKEN_URL     = "https://opensky-network.org/api/auth/token"
+    TOKEN_REFRESH_MARGIN = 30  # refresh this many seconds before expiry
+
+    OPENSKY_URL = (
+        f"https://opensky-network.org/api/states/all"
+        f"?lamin={LAMIN}&lomin={LOMIN}&lamax={LAMAX}&lomax={LOMAX}"
+    )
+
+    # Field order in the OpenSky state vector array
+    _FIELDS = [
+        "icao24", "callsign", "origin_country", "time_position", "last_contact",
+        "longitude", "latitude", "baro_altitude", "on_ground", "velocity",
+        "true_track", "vertical_rate", "sensors", "geo_altitude", "squawk",
+        "spi", "position_source",
+    ]
+
+    # ── OAuth2 token manager ──────────────────────────────────────────────────
+    class TokenManager:
+        def __init__(self):
+            self._token      = None
+            self._expires_at = None
+
+        def get_token(self) -> str | None:
+            """Return a valid Bearer token, refreshing if needed. Returns None if no creds."""
+            if not CLIENT_ID:
+                return None
+            if self._token and self._expires_at and datetime.now() < self._expires_at:
+                return self._token
+            return self._refresh()
+
+        def _refresh(self) -> str:
+            print("[producer] Refreshing OpenSky OAuth2 token...", flush=True)
+            r = requests.post(
+                TOKEN_URL,
+                data={
+                    "grant_type":    "client_credentials",
+                    "client_id":     CLIENT_ID,
+                    "client_secret": CLIENT_SECRET,
+                },
+                timeout=15,
+            )
+            r.raise_for_status()
+            data = r.json()
+            self._token      = data["access_token"]
+            expires_in       = int(data.get("expires_in", 3600))
+            self._expires_at = datetime.now() + timedelta(seconds=expires_in - TOKEN_REFRESH_MARGIN)
+            print(f"[producer] Token acquired, valid for {expires_in}s", flush=True)
+            return self._token
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+    def _state_to_dict(sv: list) -> dict:
+        d = {_FIELDS[i]: sv[i] for i in range(min(len(_FIELDS), len(sv)))}
+        d.pop("sensors", None)
+        d.pop("geo_altitude", None)
+        d["producer_ts"] = int(time.time())
+        return d
+
+    def _wait_for_kafka(max_retries: int = 30) -> KafkaProducer:
+        for attempt in range(1, max_retries + 1):
+            try:
+                producer = KafkaProducer(
+                    bootstrap_servers=BOOTSTRAP,
+                    value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+                    acks=1,
+                    retries=3,
+                )
+                print(f"[producer] Connected to Kafka at {BOOTSTRAP}", flush=True)
+                return producer
+            except NoBrokersAvailable:
+                print(f"[producer] Kafka not ready ({attempt}/{max_retries}) — retrying in 5s", flush=True)
+                time.sleep(5)
+        raise RuntimeError(f"Could not connect to Kafka at {BOOTSTRAP} after {max_retries} attempts")
+
+    # ── Main loop ─────────────────────────────────────────────────────────────
+    def main():
+        kafka    = _wait_for_kafka()
+        tokens   = TokenManager()
+        retry_delay = POLL_INTERVAL
+
+        if CLIENT_ID:
+            print(f"[producer] OAuth2 mode — client_id={CLIENT_ID}", flush=True)
+        else:
+            print("[producer] Anonymous mode (no credentials — rate limits apply)", flush=True)
+
+        print(f"[producer] Polling OpenSky every {POLL_INTERVAL}s for ORY box", flush=True)
+
+        while True:
+            try:
+                headers = {}
+                token = tokens.get_token()
+                if token:
+                    headers["Authorization"] = f"Bearer {token}"
+
+                resp = requests.get(OPENSKY_URL, headers=headers, timeout=20)
+                if resp.status_code == 429:
+                    retry_delay = min(retry_delay * 2, 300)
+                    print(f"[producer] Rate-limited (429) — backing off {retry_delay}s", flush=True)
+                    time.sleep(retry_delay)
+                    continue
+                resp.raise_for_status()
+                data   = resp.json()
+                states = data.get("states") or []
+                count  = 0
+                for sv in states:
+                    msg = _state_to_dict(sv)
+                    kafka.send(TOPIC, value=msg, key=(msg.get("icao24") or "").encode())
+                    count += 1
+                kafka.flush()
+                retry_delay = POLL_INTERVAL
+                print(f"[producer] Published {count} vectors → {TOPIC}", flush=True)
+            except Exception as exc:
+                print(f"[producer] Error: {exc}", flush=True)
+            time.sleep(retry_delay)
+
+    if __name__ == "__main__":
+        main()
+---
+# Deployment — runs the producer using a Python slim image with kafka-python
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: adsb-producer
+  namespace: plane-track
+  labels:
+    app: adsb-producer
+    app.kubernetes.io/part-of: plane-track
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: adsb-producer
+  template:
+    metadata:
+      labels:
+        app: adsb-producer
+    spec:
+      serviceAccountName: plane-track-sa
+      initContainers:
+        # Install kafka-python before the main container starts
+        - name: pip-install
+          image: docker.io/python:3.12-slim
+          command:
+            - /bin/sh
+            - -c
+            - |
+              pip install --quiet --no-cache-dir kafka-python-ng requests --target /deps ; rm -rf /deps/kafka-[0-9]*.dist-info 2>/dev/null ; echo "deps ready"
+          volumeMounts:
+            - name: deps
+              mountPath: /deps
+      containers:
+        - name: producer
+          image: docker.io/python:3.12-slim
+          command:
+            - /bin/sh
+            - -c
+            - |
+              export PYTHONPATH=/deps
+              python /scripts/producer.py
+          env:
+            - name: KAFKA_BOOTSTRAP
+              value: "broker:29092"
+            - name: KAFKA_TOPIC
+              value: "adsb_raw"
+            - name: POLL_INTERVAL
+              value: "60"
+            # ORY approach bounding box
+            - name: LAMIN
+              value: "48.10"
+            - name: LOMIN
+              value: "1.90"
+            - name: LAMAX
+              value: "49.15"
+            - name: LOMAX
+              value: "2.90"
+            # OpenSky OAuth2 client credentials (v2 API).
+            # optional: true — if the Secret does not exist, the env vars are empty and
+            # the producer falls back to anonymous mode (rate-limited but functional).
+            - name: OPENSKY_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: opensky-creds
+                  key: client_id
+                  optional: true
+            - name: OPENSKY_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: opensky-creds
+                  key: client_secret
+                  optional: true
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "256Mi"
+              cpu: "200m"
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+            - name: deps
+              mountPath: /deps
+      volumes:
+        - name: scripts
+          configMap:
+            name: adsb-producer-script
+        - name: deps
+          emptyDir: {}
+
+
+

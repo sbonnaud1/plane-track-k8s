@@ -1,0 +1,2236 @@
+---
+# ConfigMap holding the alerts dashboard Flask application.
+# Consumes all 5 CEP Kafka topics: ory_missed_approach, ory_twin_landing,
+# ory_rapid_descent, ory_corridor_overload, ory_repeated_goaround.
+# Serves a live web UI at port 8080 with an OpenShift Route.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alerts-dashboard-script
+  namespace: plane-track
+data:
+  app.py: |
+    """
+    alerts-dashboard / app.py
+    Flask web UI that tails the CEP output Kafka topics and serves a
+    live dashboard of ORY aviation alerts, split into:
+      - LIVE section      : real OpenSky ADS-B data (icao24 NOT starting with "SIM")
+      - SIMULATED section : events injected by adsb-simulator (icao24 starts with "SIM")
+
+    Routes:
+      GET /            → HTML dashboard
+      GET /api/alerts  → JSON list of recent alerts (last 20, newest first)
+      GET /api/raw     → JSON list of recent raw ADS-B vectors (last 200)
+      GET /api/health  → JSON Flink job health {flink_status, job_id, job_name}
+      GET /healthz     → liveness probe
+    """
+    import json
+    import os
+    import threading
+    import time
+    from collections import deque
+    from datetime import datetime, timezone
+
+    import requests as _requests
+
+    from flask import Flask, jsonify, render_template_string
+
+    from kafka import KafkaConsumer
+    from kafka.errors import NoBrokersAvailable
+
+    BOOTSTRAP  = os.environ.get("KAFKA_BOOTSTRAP", "broker:29092")
+    FLINK_API  = os.environ.get("FLINK_API", "http://flink-jobmanager:9081")
+    TOPICS     = ["ory_missed_approach", "ory_twin_landing",
+                  "ory_repeated_goaround", "ory_rapid_descent", "ory_corridor_overload"]
+    PORT       = int(os.environ.get("PORT", "8080"))
+    MAX_ALERTS = 200
+    MAX_RAW    = 200  # max raw ADS-B vectors kept in memory for Flight Events tab
+
+    app = Flask(__name__)
+
+    _alerts: deque = deque(maxlen=MAX_ALERTS)
+    _raw:    deque = deque(maxlen=MAX_RAW)   # latest raw ADS-B vectors
+    _lock          = threading.Lock()
+    _seq           = 0   # monotonic alert counter — stable lookup key in the UI
+    # Per-topic deduplication: suppress repeated alerts for the same aircraft/pair.
+    # Key: (topic, canonical_id) → epoch of last accepted alert.
+    _dedup_seen: dict = {}
+    # TW uses HOP(90s, slide 10s) → up to 9 overlapping windows per event.
+    # 300s cooldown ensures only 1 TW alert per aircraft pair per demo cycle.
+    # Other topics: 90s is enough to absorb Flink re-emissions.
+    _DEDUP_COOLDOWN_TW  = 300  # seconds — twin landing
+    _DEDUP_COOLDOWN_DEF =  90  # seconds — all other topics
+    _seek_event    = threading.Event()   # set by /sim/reset: alerts consumer must seek to end
+    _seek_done     = threading.Event()   # set by alerts consumer after seek+clear complete
+    _consumer_ref  = [None]              # holds live alerts KafkaConsumer so reset can seek it
+    _raw_seek_event = threading.Event()  # set by /sim/reset: raw consumer must seek to end
+    _raw_seek_done  = threading.Event()  # set by raw consumer after seek+clear complete
+    _raw_consumer_ref = [None]           # holds live raw KafkaConsumer so reset can seek it
+
+    def _is_simulated(alert: dict) -> bool:
+        """Return True when all icao24 fields in the alert belong to the simulator."""
+        for key in ("icao24", "icao24_a", "icao24_b"):
+            val = alert.get(key, "")
+            if val and not str(val).upper().startswith("SIM"):
+                return False
+        return True
+
+    def _dedup_key(alert: dict):
+        """Return a (topic, canonical_id) dedup key for any alert topic."""
+        t = alert.get("_topic", "")
+        if t == "ory_twin_landing":
+            a = alert.get("icao24_a", "") or ""
+            b = alert.get("icao24_b", "") or ""
+            # Canonical order so (A,B) and (B,A) collapse to the same key
+            return (t, tuple(sorted([a, b])))
+        else:
+            return (t, alert.get("icao24", "") or "")
+
+    # ── Kafka consumer thread ────────────────────────────────────────────────
+    def _consume():
+        global _seq, _dedup_seen
+        consumer = None
+        while consumer is None:
+            try:
+                consumer = KafkaConsumer(
+                    *TOPICS,
+                    bootstrap_servers=BOOTSTRAP,
+                    auto_offset_reset="earliest",
+                    enable_auto_commit=False,
+                    # No group_id — each pod start gets a fresh anonymous consumer.
+                    # "earliest" replays existing alerts on restart so the dashboard
+                    # is never empty after a pod reschedule.
+                    value_deserializer=lambda m: json.loads(m.decode("utf-8", errors="replace")),
+                    consumer_timeout_ms=1000,
+                )
+                _consumer_ref[0] = consumer
+                print(f"[dashboard] Kafka consumer connected to {BOOTSTRAP}", flush=True)
+            except NoBrokersAvailable:
+                print("[dashboard] Kafka not ready — retrying in 5s", flush=True)
+                time.sleep(5)
+
+        while True:
+            try:
+                # If reset was requested: seek to end, wipe state, then signal done.
+                if _seek_event.is_set():
+                    consumer.seek_to_end()
+                    with _lock:
+                        _alerts.clear()
+                        _dedup_seen.clear()
+                        _seq = 0
+                    _seek_event.clear()
+                    _seek_done.set()
+                    print("[dashboard] Consumer seeked to end and deque cleared", flush=True)
+
+                for msg in consumer:
+                    # Re-check seek flag between messages; break immediately if reset fires
+                    if _seek_event.is_set():
+                        break
+                    alert = msg.value or {}
+                    alert["_topic"]          = msg.topic
+                    now_epoch                = time.time()
+                    alert["_received_at"]    = datetime.fromtimestamp(now_epoch, tz=timezone.utc).strftime("%H:%M:%S UTC")
+                    alert["_received_epoch"] = now_epoch
+                    alert["_simulated"]      = _is_simulated(alert)
+                    dk = _dedup_key(alert)
+                    cooldown = _DEDUP_COOLDOWN_TW if alert.get("_topic") == "ory_twin_landing" else _DEDUP_COOLDOWN_DEF
+                    with _lock:
+                        last = _dedup_seen.get(dk)
+                        if last and (now_epoch - last) < cooldown:
+                            continue
+                        _dedup_seen[dk] = now_epoch
+                        _seq += 1
+                        alert["_id"] = _seq
+                        _alerts.appendleft(alert)
+            except Exception as exc:
+                print(f"[dashboard] Consumer error: {exc}", flush=True)
+                time.sleep(2)
+
+    _t = threading.Thread(target=_consume, daemon=True)
+    _t.start()
+
+    # ── Raw ADS-B consumer (adsb_raw → _raw deque) ───────────────────────────
+    def _consume_raw():
+        consumer = None
+        while consumer is None:
+            try:
+                consumer = KafkaConsumer(
+                    "adsb_raw",
+                    bootstrap_servers=BOOTSTRAP,
+                    auto_offset_reset="latest",
+                    enable_auto_commit=False,
+                    value_deserializer=lambda m: json.loads(m.decode("utf-8", errors="replace")),
+                    consumer_timeout_ms=1000,
+                )
+                _raw_consumer_ref[0] = consumer
+                print(f"[dashboard] Raw consumer connected to {BOOTSTRAP}", flush=True)
+            except NoBrokersAvailable:
+                time.sleep(5)
+        while True:
+            try:
+                # If reset was requested: seek to end, wipe deque, then signal done.
+                if _raw_seek_event.is_set():
+                    consumer.seek_to_end()
+                    with _lock:
+                        _raw.clear()
+                    _raw_seek_event.clear()
+                    _raw_seek_done.set()
+                    print("[dashboard] Raw consumer seeked to end and deque cleared", flush=True)
+
+                for msg in consumer:
+                    if _raw_seek_event.is_set():
+                        break
+                    v = msg.value or {}
+                    v["_received_at"] = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+                    with _lock:
+                        _raw.appendleft(v)
+            except Exception as exc:
+                print(f"[dashboard] Raw consumer error: {exc}", flush=True)
+                time.sleep(2)
+
+    threading.Thread(target=_consume_raw, daemon=True).start()
+
+    # ── Flask routes ─────────────────────────────────────────────────────────
+    @app.route("/healthz")
+    def healthz():
+        return "ok", 200
+
+    @app.route("/api/alerts")
+    def api_alerts():
+        with _lock:
+            return jsonify(list(_alerts))
+
+    @app.route("/api/raw")
+    def api_raw():
+        with _lock:
+            return jsonify(list(_raw))
+
+    @app.route("/api/alert/<int:idx>")
+    def api_alert(idx):
+        with _lock:
+            alerts = list(_alerts)
+        if idx < 0 or idx >= len(alerts):
+            return jsonify({"error": "not found"}), 404
+        return jsonify(alerts[idx])
+
+    @app.route("/api/health")
+    def api_health():
+        """Check if the Flink CEP job is running. Used by the dashboard header dot."""
+        try:
+            resp = _requests.get(f"{FLINK_API}/jobs/overview", timeout=3)
+            jobs = resp.json().get("jobs", [])
+            running = [j for j in jobs if j.get("state") == "RUNNING"]
+            if running:
+                j = running[0]
+                return jsonify({"flink_status": "RUNNING",
+                                "job_id": j.get("jid"), "job_name": j.get("name")})
+            elif jobs:
+                return jsonify({"flink_status": jobs[0].get("state", "UNKNOWN"),
+                                "job_id": jobs[0].get("jid"), "job_name": jobs[0].get("name")})
+            else:
+                return jsonify({"flink_status": "NO_JOB"})
+        except Exception as e:
+            return jsonify({"flink_status": "ERROR", "detail": str(e)})
+
+    # ── Simulator control routes ──
+    def _scale_simulator(replicas):
+        """Scale adsb-simulator deployment via the in-cluster Kubernetes API.
+        Raises RuntimeError with a human-readable message on failure."""
+        token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+        ca         = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+        try:
+            token = open(token_path).read().strip()
+        except OSError as e:
+            raise RuntimeError(f"Cannot read SA token: {e}")
+        url = ("https://kubernetes.default.svc/apis/apps/v1"
+               "/namespaces/plane-track/deployments/adsb-simulator/scale")
+        try:
+            resp = _requests.patch(
+                url,
+                headers={"Authorization": "Bearer " + token,
+                         "Content-Type": "application/merge-patch+json"},
+                data=json.dumps({"spec": {"replicas": replicas}}),
+                verify=ca,
+                timeout=10,
+            )
+        except Exception as e:
+            raise RuntimeError(f"K8s PATCH failed: {e}")
+        if not resp.ok:
+            raise RuntimeError(f"K8s returned {resp.status_code}: {resp.text[:200]}")
+
+    @app.route("/sim/start", methods=["POST"])
+    def sim_start():
+        global _seq
+        # Stop simulator first (force fresh pod even if already running).
+        try:
+            _scale_simulator(0)
+        except RuntimeError as e:
+            print(f"[dashboard] sim/start (scale-down) error: {e}", flush=True)
+            return jsonify({"status": "error", "message": str(e)}), 500
+
+        # Seek consumer to end + clear deque so Start always shows only new alerts.
+        _seek_done.clear()
+        _seek_event.set()
+        if not _seek_done.wait(timeout=3.0):
+            with _lock:
+                _alerts.clear()
+                _seq = 0
+            _seek_event.clear()
+
+        try:
+            _scale_simulator(1)
+            return jsonify({"status": "started"})
+        except RuntimeError as e:
+            print(f"[dashboard] sim/start (scale-up) error: {e}", flush=True)
+            return jsonify({"status": "error", "message": str(e)}), 500
+
+    @app.route("/sim/stop", methods=["POST"])
+    def sim_stop():
+        try:
+            _scale_simulator(0)
+            return jsonify({"status": "stopped"})
+        except RuntimeError as e:
+            print(f"[dashboard] sim/stop error: {e}", flush=True)
+            return jsonify({"status": "error", "message": str(e)}), 500
+
+    @app.route("/sim/reset", methods=["POST"])
+    def sim_reset():
+        global _seq
+        # 1. Stop simulator so no new Kafka events arrive during the wipe
+        try:
+            _scale_simulator(0)
+        except RuntimeError as e:
+            return jsonify({"status": "error", "message": f"stop failed: {e}"}), 500
+
+        # 2. Signal both consumer threads simultaneously to seek to end + clear their deques.
+        #    Both events are set before waiting so both consumers start seeking in parallel.
+        #    We wait for both done-events with a shared 3 s deadline.
+        _seek_done.clear()
+        _raw_seek_done.clear()
+        _seek_event.set()       # signal alerts consumer
+        _raw_seek_event.set()   # signal raw consumer — both now seeking in parallel
+
+        if not _seek_done.wait(timeout=3.0):
+            # Alerts consumer didn't acknowledge in time — clear directly as fallback
+            with _lock:
+                _alerts.clear()
+                _seq = 0
+            _seek_event.clear()
+
+        if not _raw_seek_done.wait(timeout=3.0):
+            # Raw consumer didn't acknowledge in time — clear directly as fallback
+            with _lock:
+                _raw.clear()
+            _raw_seek_event.clear()
+
+        # 3. Restart simulator
+        try:
+            _scale_simulator(1)
+        except RuntimeError as e:
+            return jsonify({"status": "error", "message": f"restart failed: {e}"}), 500
+        return jsonify({"status": "reset"})
+
+    _HTML = """<!--HTML_START--><!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      <title>ORY CEP Alerts Dashboard</title>
+      <style>
+        *, *::before, *::after { box-sizing: border-box; }
+        body   { font-family: 'Segoe UI', sans-serif; background:#0d1117; color:#e6edf3; margin:0; padding:0; }
+
+        /* ── Header ── */
+        header { background:#161b22; padding:12px 24px; border-bottom:2px solid #21262d;
+                 display:flex; align-items:center; gap:16px; }
+        header h1  { margin:0; font-size:19px; color:#e6edf3; flex:1; }
+        .hdr-meta  { font-size:12px; color:#8b949e; white-space:nowrap; }
+        .hdr-dot   { display:inline-block; width:8px; height:8px; border-radius:50%;
+                     background:#3fb950; margin-right:5px; transition:background .4s; }
+        .hdr-dot.warn  { background:#d29922; }
+        .hdr-dot.error { background:#f85149; }
+
+        /* ── Tab bar ── */
+        .tabbar { background:#161b22; border-bottom:1px solid #21262d;
+                  display:flex; gap:0; padding:0 24px; }
+        .tab    { padding:10px 18px; font-size:14px; color:#8b949e; cursor:pointer;
+                  border-bottom:2px solid transparent; margin-bottom:-1px;
+                  user-select:none; white-space:nowrap; position:relative; }
+        .tab:hover  { color:#e6edf3; }
+        .tab.active { color:#58a6ff; border-bottom-color:#58a6ff; }
+        /* alert count badge on tab */
+        .tab-badge { display:inline-block; margin-left:6px; background:#f85149;
+                     color:#fff; border-radius:10px; padding:1px 6px;
+                     font-size:11px; font-weight:700; vertical-align:middle;
+                     min-width:18px; text-align:center; }
+        .tab-badge.empty { display:none; }
+
+        /* ── Tab content ── */
+        .tabcontent       { display:none; }
+        .tabcontent.active{ display:block; }
+
+        /* ── Single-panel alerts layout ── */
+        .panel       { padding:18px 20px; min-height:calc(100vh - 130px); }
+        .panel-live  { background:#0f1318; }
+        .panel-sim   { background:#161b22; }
+        .panel-title     { display:flex; align-items:center; gap:10px;
+                           margin-bottom:14px; padding-bottom:10px;
+                           border-bottom:1px solid #21262d; }
+        .panel-title h2  { margin:0; font-size:15px; font-weight:600; }
+        .panel-title .count { font-size:12px; color:#8b949e;
+                              background:#21262d; border-radius:10px;
+                              padding:1px 8px; }
+        .panel-live .panel-title h2 { color:#58a6ff; }
+        .live-dot { display:inline-block; width:8px; height:8px; border-radius:50%;
+                    background:#3fb950; margin-right:6px; box-shadow:0 0 6px #3fb950; }
+        .panel-sim .panel-title h2  { color:#bc8cff; }
+        .sim-icon { margin-right:6px; font-size:14px; }
+        .sim-banner { background:#1e1433; border:1px solid #6e40c9; border-radius:6px;
+                      padding:8px 12px; margin-bottom:14px; font-size:11px; color:#bc8cff; }
+
+        /* ── Alert cards ── */
+        .card        { border-radius:6px; padding:8px 12px; margin-bottom:6px;
+                       border-left:3px solid transparent; }
+        .card-missed { background:#1a0d0d; border-color:#f85149; }
+        .card-twin   { background:#1a1500; border-color:#d29922; }
+        .card-rga    { background:#0d1a1a; border-color:#ff7b72; }
+        .card-rd     { background:#1a0a00; border-color:#ff6b35; }
+        .card-co     { background:#0d1a2a; border-color:#79c0ff; }
+        .panel-sim .card-missed { background:#130d0d; border-color:#7a3c3a; }
+        .panel-sim .card-twin   { background:#13120a; border-color:#6b5a1a; }
+        .panel-sim .card-rga    { background:#0a1212; border-color:#5a3030; }
+        .panel-sim .card-rd     { background:#130800; border-color:#7a4020; }
+        .panel-sim .card-co     { background:#0a1220; border-color:#304060; }
+        .card-header { display:none; }
+        .card-footer { display:none; }
+        .badge { display:inline-block; padding:2px 7px; border-radius:4px;
+                 font-size:11px; font-weight:700; letter-spacing:.3px; }
+        .badge-missed { background:#f85149; color:#fff; }
+        .badge-twin   { background:#d29922; color:#fff; }
+        .badge-rga    { background:#ff7b72; color:#0d1117; }
+        .badge-rd     { background:#ff6b35; color:#0d1117; }
+        .badge-co     { background:#79c0ff; color:#0d1117; }
+        .panel-sim .badge-missed { background:#7a3c3a; }
+        .panel-sim .badge-twin   { background:#6b5a1a; }
+        .panel-sim .badge-rga    { background:#5a3030; color:#e6edf3; }
+        .panel-sim .badge-rd     { background:#7a4020; color:#e6edf3; }
+        .panel-sim .badge-co     { background:#304060; color:#e6edf3; }
+        .card-line1 { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+        .card-line2 { display:contents; }
+        .card-body  { font-size:13px; line-height:1.4; flex:1; min-width:0; }
+        .card-body strong { color:#e6edf3; }
+        .card-body .muted { color:#8b949e; font-size:12px; }
+        .card-ts    { font-size:11px; color:#8b949e; }
+        .card-age   { font-size:11px; color:#57606a; }
+        .card-sep   { font-size:11px; color:#30363d; }
+        .details-link { font-size:12px; color:#58a6ff; cursor:pointer;
+                        background:none; border:none; padding:0;
+                        text-decoration:underline; text-underline-offset:2px; }
+        .details-link:hover { color:#79c0ff; }
+        .empty { color:#8b949e; font-size:12px; padding:20px 0; text-align:center; }
+        /* ── New card pulse animation ── */
+        @keyframes card-pulse {
+          0%   { box-shadow: 0 0 0 0 rgba(88,166,255,.5); }
+          60%  { box-shadow: 0 0 0 8px rgba(88,166,255,0); }
+          100% { box-shadow: 0 0 0 0 rgba(88,166,255,0); }
+        }
+        .card-new { animation: card-pulse 1.4s ease-out 2; }
+
+        /* ── Slide-over drawer ── */
+        .drawer-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,.55);
+                          z-index:100; }
+        .drawer-overlay.open { display:block; }
+        .drawer { position:fixed; top:0; right:-520px; width:500px; height:100vh;
+                  background:#161b22; border-left:1px solid #30363d;
+                  overflow-y:auto; z-index:101; padding:0;
+                  transition:right .25s ease; }
+        .drawer.open { right:0; }
+        .drawer-header { background:#1c2233; padding:16px 20px;
+                         display:flex; align-items:center; gap:10px;
+                         border-bottom:1px solid #30363d; position:sticky; top:0; }
+        .drawer-header h2 { margin:0; font-size:15px; flex:1; }
+        .drawer-close { background:none; border:none; color:#8b949e; font-size:20px;
+                        cursor:pointer; line-height:1; padding:0 4px; }
+        .drawer-close:hover { color:#e6edf3; }
+        .drawer-body { padding:20px; }
+        .drawer-body h3 { font-size:12px; font-weight:700; color:#8b949e;
+                          text-transform:uppercase; letter-spacing:.6px;
+                          margin:20px 0 8px; padding-bottom:6px;
+                          border-bottom:1px solid #21262d; }
+        .drawer-body h3:first-child { margin-top:0; }
+        .drawer-body p  { font-size:13px; line-height:1.7; color:#c9d1d9; margin:0 0 8px; }
+        .drawer-body code { background:#21262d; border:1px solid #30363d; border-radius:4px;
+                            padding:1px 6px; font-size:11px; color:#79c0ff; }
+        .fact-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin:10px 0; }
+        .fact { background:#0d1117; border:1px solid #21262d; border-radius:6px;
+                padding:8px 12px; }
+        .fact .label { font-size:10px; color:#8b949e; text-transform:uppercase;
+                       letter-spacing:.5px; margin-bottom:3px; }
+        .fact .value { font-size:14px; font-weight:600; color:#e6edf3; }
+        .fact .value.red    { color:#f85149; }
+        .fact .value.green  { color:#3fb950; }
+        .fact .value.yellow { color:#d29922; }
+        .severity-bar { height:6px; border-radius:3px; margin:12px 0 4px;
+                        background:linear-gradient(to right,#3fb950,#d29922,#f85149); }
+        .severity-label { display:flex; justify-content:space-between;
+                          font-size:10px; color:#8b949e; }
+        .drawer-svg { background:#0d1117; border:1px solid #21262d; border-radius:6px;
+                      padding:12px; margin:12px 0; overflow-x:auto; }
+        .drawer-svg svg { display:block; margin:0 auto; }
+        .loading { color:#8b949e; font-size:13px; text-align:center; padding:40px 0; }
+
+        /* ── About tab ── */
+        .about { max-width:900px; margin:0 auto; padding:32px 28px; }
+        .about h2 { font-size:20px; color:#58a6ff; margin:0 0 6px; }
+        .about .subtitle { color:#8b949e; font-size:13px; margin-bottom:28px; }
+        .about h3 { font-size:14px; color:#e6edf3; margin:28px 0 10px;
+                    padding-bottom:6px; border-bottom:1px solid #21262d; }
+        .about p, .about li { font-size:13px; line-height:1.7; color:#c9d1d9; }
+        .about ul { margin:8px 0 0 0; padding-left:20px; }
+        .about li { margin-bottom:4px; }
+        .about code { background:#21262d; border:1px solid #30363d; border-radius:4px;
+                      padding:1px 6px; font-size:12px; color:#79c0ff; }
+        .about strong { color:#e6edf3; }
+
+        /* stack pills */
+        .pills { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
+        .pill  { background:#21262d; border:1px solid #30363d; border-radius:20px;
+                 padding:4px 12px; font-size:12px; color:#8b949e; }
+        .pill span { color:#e6edf3; font-weight:600; }
+
+        /* alert-type cards in about */
+        .atype-grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-top:12px; }
+        .atype      { border-radius:8px; padding:16px 18px; border-left:4px solid; }
+        .atype-ma   { background:#1a0d0d; border-color:#f85149; }
+        .atype-tw   { background:#1a1500; border-color:#d29922; }
+        .atype-rga  { background:#0d1a1a; border-color:#ff7b72; }
+        .atype-rd   { background:#1a0a00; border-color:#ff6b35; }
+        .atype-co   { background:#0d1a2a; border-color:#79c0ff; }
+        .atype h4   { margin:0 0 8px; font-size:13px; }
+        .atype-ma h4 { color:#f85149; }
+        .atype-tw h4 { color:#d29922; }
+        .atype-rga h4{ color:#ff7b72; }
+        .atype-rd h4 { color:#ff6b35; }
+        .atype-co h4 { color:#79c0ff; }
+        .atype p    { margin:0; font-size:12px; color:#8b949e; line-height:1.6; }
+        .atype .thresholds { margin-top:10px; font-size:11px; color:#8b949e;
+                             border-top:1px solid #30363d; padding-top:8px; }
+        .atype .thresholds code { font-size:10px; }
+
+        /* SVG diagrams */
+        .diagram { background:#161b22; border:1px solid #21262d; border-radius:8px;
+                   padding:20px; margin-top:12px; overflow-x:auto; }
+        .diagram svg { display:block; margin:0 auto; }
+
+        /* ── Filter chips bar ── */
+        .filter-bar { display:flex; align-items:center; gap:6px; margin-bottom:12px; flex-wrap:wrap; }
+        .fchip {
+          display:inline-flex; align-items:center; gap:5px;
+          padding:4px 12px; border-radius:20px; font-size:12px; font-weight:600;
+          cursor:pointer; border:1px solid transparent;
+          transition:background .15s, border-color .15s, opacity .15s;
+          user-select:none; position:relative;
+        }
+        .fchip-all   { background:#21262d; color:#8b949e; border-color:#30363d; }
+        .fchip-ma    { background:#1a0d0d; color:#f85149; border-color:#3a1212; }
+        .fchip-tw    { background:#1a1500; color:#d29922; border-color:#3a3000; }
+        .fchip-rga   { background:#0d1a1a; color:#ff7b72; border-color:#2a3030; }
+        .fchip-rd    { background:#1a0a00; color:#ff6b35; border-color:#3a2010; }
+        .fchip-co    { background:#0d1a2a; color:#79c0ff; border-color:#203040; }
+        .fchip.active.fchip-all { background:#30363d; color:#e6edf3; border-color:#58a6ff; }
+        .fchip.active.fchip-ma  { background:#3a1212; color:#ff7b72; border-color:#f85149; }
+        .fchip.active.fchip-tw  { background:#3a3000; color:#e3b341; border-color:#d29922; }
+        .fchip.active.fchip-rga { background:#1a2a2a; color:#ffadad; border-color:#ff7b72; }
+        .fchip.active.fchip-rd  { background:#2a1500; color:#ffb085; border-color:#ff6b35; }
+        .fchip.active.fchip-co  { background:#1a2a3a; color:#b8d8ff; border-color:#79c0ff; }
+        .fchip:hover { opacity:.85; }
+
+        /* ── Explainer popover ── */
+        .fchip-info {
+          display:inline-flex; align-items:center; justify-content:center;
+          width:14px; height:14px; border-radius:50%;
+          background:rgba(255,255,255,.08); color:#8b949e;
+          font-size:9px; font-weight:700; font-style:normal;
+          cursor:pointer; margin-left:2px; flex-shrink:0;
+          border:1px solid rgba(255,255,255,.12);
+        }
+        .fchip-info:hover { background:rgba(255,255,255,.18); color:#e6edf3; }
+        .popover {
+          display:none; position:fixed; z-index:200;
+          background:#1c2233; border:1px solid #30363d; border-radius:8px;
+          padding:14px 16px; width:320px;
+          box-shadow:0 8px 24px rgba(0,0,0,.5);
+          pointer-events:none;
+        }
+        .popover.open { display:block; }
+        .popover h4 { margin:0 0 8px; font-size:12px; }
+        .popover p  { margin:0 0 8px; font-size:11px; color:#c9d1d9; line-height:1.6; }
+        .popover .pop-rules { font-size:10px; color:#8b949e; font-family:monospace;
+                              background:#0d1117; border:1px solid #21262d;
+                              border-radius:4px; padding:6px 8px; margin-top:6px; line-height:1.8; }
+
+        /* ── Sim control bar ── */
+        .sim-controls { display:flex; align-items:center; gap:8px; margin-bottom:14px; }
+        .sim-btn { display:inline-flex; align-items:center; gap:5px;
+                   border:none; border-radius:5px; padding:5px 13px;
+                   font-size:12px; font-weight:600; cursor:pointer;
+                   transition:opacity .15s; }
+        .sim-btn:hover { opacity:.8; }
+        .sim-btn:disabled { opacity:.4; cursor:default; }
+        .sim-btn-start  { background:#1e3a1e; color:#3fb950; border:1px solid #2a5a2a; }
+        .sim-btn-stop   { background:#3a1e1e; color:#f85149; border:1px solid #5a2a2a; }
+        .sim-btn-reset  { background:#21262d; color:#8b949e; border:1px solid #30363d; }
+        .sim-status { font-size:11px; color:#8b949e; margin-left:4px;
+                      max-width:380px; overflow:hidden; text-overflow:ellipsis;
+                      white-space:nowrap; display:inline-block; vertical-align:middle; }
+      </style>
+    </head>
+    <body>
+      <header>
+       <h1>✈ ORY CEP Alerts — Paris Orly Airport</h1>
+       <span class="hdr-meta">
+         <span class="hdr-dot" id="flink-dot" title="Flink: checking…"></span>
+         Flink <span id="flink-status-text" style="margin-right:8px">…</span>
+         &nbsp;·&nbsp; <span class="hdr-dot"></span>
+         Kafka &nbsp;·&nbsp; live poll 3 s &nbsp;·&nbsp; <span id="hdr-clock">--:--:-- UTC</span>
+       </span>
+     </header>
+
+      <!-- Tab bar -->
+      <div class="tabbar">
+        <div class="tab active" id="tab-btn-sim">🧪 Simulated<span class="tab-badge empty" id="tab-badge-sim">0</span></div>
+        <div class="tab"        id="tab-btn-live">📡 Live — OpenSky ADS-B<span class="tab-badge empty" id="tab-badge-live">0</span></div>
+        <div class="tab"        id="tab-btn-events">🧪 Simulated Flight Events</div>
+        <div class="tab"        id="tab-btn-about">📖 About &amp; Architecture</div>
+      </div>
+
+      <!-- ══════════════════════ TAB: SIMULATED ══════════════════════ -->
+      <div id="tab-sim" class="tabcontent active">
+        <div class="panel panel-sim">
+          <div class="panel-title">
+            <h2><span class="sim-icon">🧪</span>Simulated — ADS-B Simulator</h2>
+            <span class="count" id="count-sim">0 event(s)</span>
+          </div>
+          <div class="filter-bar" id="filter-bar-sim">
+            <span class="fchip fchip-all active" data-panel="sim" data-filter="all">All</span>
+            <span class="fchip fchip-ma"  data-panel="sim" data-filter="ma">🔴 Missed Approach<i class="fchip-info" data-pop="pop-ma">?</i></span>
+            <span class="fchip fchip-tw"  data-panel="sim" data-filter="tw">🟡 Twin Landing<i class="fchip-info" data-pop="pop-tw">?</i></span>
+            <span class="fchip fchip-rga" data-panel="sim" data-filter="rga">🔁 Repeat Go-Around<i class="fchip-info" data-pop="pop-rga">?</i></span>
+            <span class="fchip fchip-rd"  data-panel="sim" data-filter="rd">🔻 Rapid Descent<i class="fchip-info" data-pop="pop-rd">?</i></span>
+            <span class="fchip fchip-co"  data-panel="sim" data-filter="co">🔵 Corridor Overload<i class="fchip-info" data-pop="pop-co">?</i></span>
+          </div>
+          <div class="sim-banner">
+            Synthetic events injected by the <strong>ADS-B Simulation</strong> pod.
+            Aircraft IDs start with <code>SIM</code> — not real traffic.
+          </div>
+          <div class="sim-controls">
+            <button class="sim-btn sim-btn-start"  id="sim-btn-start">&#9654; Start</button>
+            <button class="sim-btn sim-btn-stop"   id="sim-btn-stop">&#9646;&#9646; Stop</button>
+            <button class="sim-btn sim-btn-reset"  id="sim-btn-reset">&#8635; Reset</button>
+            <span class="sim-status" id="sim-status"></span>
+          </div>
+          <div id="panel-sim-cards">
+            <p class="empty">No simulated alerts yet — simulator starting up…</p>
+          </div>
+        </div>
+      </div><!-- /tab-sim -->
+
+      <!-- ══════════════════════ TAB: LIVE ══════════════════════ -->
+      <div id="tab-live" class="tabcontent">
+        <div class="panel panel-live">
+          <div class="panel-title">
+            <h2><span class="live-dot"></span>Live — OpenSky ADS-B</h2>
+            <span class="count" id="count-live">0 event(s)</span>
+          </div>
+          <div class="filter-bar" id="filter-bar-live">
+            <span class="fchip fchip-all active" data-panel="live" data-filter="all">All</span>
+            <span class="fchip fchip-ma"  data-panel="live" data-filter="ma">🔴 Missed Approach<i class="fchip-info" data-pop="pop-ma">?</i></span>
+            <span class="fchip fchip-rga" data-panel="live" data-filter="rga">🔁 Repeat Go-Around<i class="fchip-info" data-pop="pop-rga">?</i></span>
+            <span class="fchip fchip-rd"  data-panel="live" data-filter="rd">🔻 Rapid Descent<i class="fchip-info" data-pop="pop-rd">?</i></span>
+            <span class="fchip fchip-co"  data-panel="live" data-filter="co">🔵 Corridor Overload<i class="fchip-info" data-pop="pop-co">?</i></span>
+          </div>
+          <div id="panel-live-cards">
+            <p class="empty">No live alerts yet — waiting for real ORY traffic…</p>
+          </div>
+        </div>
+      </div><!-- /tab-live -->
+
+      <!-- ══════════════════════ TAB: FLIGHT EVENTS ══════════════════════ -->
+      <div id="tab-events" class="tabcontent">
+        <div style="padding:16px 20px">
+
+          <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap">
+            <span style="font-size:13px;font-weight:600;color:#e6edf3">Simulated ADS-B feed — <code style="font-size:11px;color:#bc8cff">adsb_raw</code> (SIM* events only)</span>
+            <span style="font-size:11px;color:#8b949e">latest 200 vectors · auto-refresh 3 s</span>
+            <span style="margin-left:auto;font-size:11px;color:#8b949e">
+              ORY box: 48.10–49.15°N / 1.90–2.90°E
+            </span>
+          </div>
+
+          <!-- Stats bar -->
+          <div style="display:flex;gap:16px;margin-bottom:14px;flex-wrap:wrap" id="ev-stats">
+            <div style="background:#161b22;border:1px solid #21262d;border-radius:6px;padding:8px 14px;min-width:110px">
+              <div style="font-size:10px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px;margin-bottom:3px">Aircraft tracked</div>
+              <div style="font-size:20px;font-weight:700;color:#58a6ff" id="ev-count">—</div>
+            </div>
+            <div style="background:#161b22;border:1px solid #21262d;border-radius:6px;padding:8px 14px;min-width:110px">
+              <div style="font-size:10px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px;margin-bottom:3px">In approach (&lt;914 m)</div>
+              <div style="font-size:20px;font-weight:700;color:#f85149" id="ev-approach">—</div>
+            </div>
+            <div style="background:#161b22;border:1px solid #21262d;border-radius:6px;padding:8px 14px;min-width:110px">
+              <div style="font-size:10px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px;margin-bottom:3px">On ground</div>
+              <div style="font-size:20px;font-weight:700;color:#3fb950" id="ev-ground">—</div>
+            </div>
+            <div style="background:#161b22;border:1px solid #21262d;border-radius:6px;padding:8px 14px;min-width:130px">
+              <div style="font-size:10px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px;margin-bottom:3px">Last update</div>
+              <div style="font-size:13px;font-weight:600;color:#8b949e" id="ev-ts">—</div>
+            </div>
+          </div>
+
+          <!-- Table -->
+          <div style="overflow-x:auto">
+            <table id="ev-table" style="width:100%;border-collapse:collapse;font-size:12px">
+              <thead>
+                <tr style="background:#161b22;color:#8b949e;font-size:10px;text-transform:uppercase;letter-spacing:.4px">
+                  <th style="padding:8px 10px;text-align:left;border-bottom:1px solid #21262d;white-space:nowrap">Callsign</th>
+                  <th style="padding:8px 10px;text-align:left;border-bottom:1px solid #21262d">ICAO24</th>
+                  <th style="padding:8px 10px;text-align:left;border-bottom:1px solid #21262d">Country</th>
+                  <th style="padding:8px 10px;text-align:right;border-bottom:1px solid #21262d;white-space:nowrap">Alt (m)</th>
+                  <th style="padding:8px 10px;text-align:right;border-bottom:1px solid #21262d;white-space:nowrap">Vrate (m/s)</th>
+                  <th style="padding:8px 10px;text-align:right;border-bottom:1px solid #21262d;white-space:nowrap">Speed (kt)</th>
+                  <th style="padding:8px 10px;text-align:right;border-bottom:1px solid #21262d">Track°</th>
+                  <th style="padding:8px 10px;text-align:center;border-bottom:1px solid #21262d">Status</th>
+                  <th style="padding:8px 10px;text-align:left;border-bottom:1px solid #21262d">Squawk</th>
+                  <th style="padding:8px 10px;text-align:left;border-bottom:1px solid #21262d;white-space:nowrap">Received</th>
+                </tr>
+              </thead>
+              <tbody id="ev-tbody">
+                <tr><td colspan="10" style="padding:30px;text-align:center;color:#8b949e">Waiting for ADS-B data…</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+        </div>
+      </div><!-- /tab-events -->
+
+      <div id="tab-about" class="tabcontent">
+        <div class="about">
+
+          <h2>ORY Plane-Track — CEP Pipeline</h2>
+          <p class="subtitle">
+            Real-time Complex Event Processing on ADS-B transponder data
+            for Paris-Orly International Airport (IATA: ORY)
+          </p>
+
+          <!-- ── Use case ── -->
+          <h3>🎯 Use Case</h3>
+          <p>
+            This platform demonstrates how to build a <strong>real-time aviation safety
+            monitoring pipeline</strong> entirely from open-source components running on
+            Kubernetes / OpenShift. It ingests live ADS-B position reports broadcast by
+            aircraft transponders, enriches them, and applies streaming CEP rules to detect
+            five abnormal flight patterns around Paris-Orly — the moment they occur, not
+            minutes later.
+          </p>
+          <p>
+            The same architecture applies to any domain that requires <strong>low-latency
+            pattern detection over high-volume event streams</strong>: logistics (vehicle
+            deviations), telecoms (network anomalies), finance (fraud sequences), or
+            industrial IoT (machine fault signatures).
+          </p>
+
+          <!-- ── Alert types ── -->
+          <h3>✈ Detected Patterns</h3>
+          <div class="atype-grid">
+
+            <div class="atype atype-ma">
+              <h4>🔴 Missed Approach</h4>
+              <p>
+                An aircraft enters the ORY final approach corridor — below
+                <strong>3 000 ft (914 m)</strong> with a descending vertical rate — then
+                climbs away without touching down. This go-around manoeuvre must be
+                detected within a <strong>10-minute event window</strong>.
+              </p>
+              <div class="thresholds">
+                Pattern: <code>APPROACH → LEVEL* → CLIMBING</code><br>
+                A: <code>alt &lt; 914 m · vrate &lt; -1 m/s · on_ground=F</code><br>
+                B: <code>alt &lt; 914 m · vrate ≤ 2 m/s  · on_ground=F</code><br>
+                C: <code>alt &gt; 200 m · vrate &gt; 2 m/s  · on_ground=F</code>
+              </div>
+            </div>
+
+            <div class="atype atype-tw">
+              <h4>🟡 Twin Landing (Simultaneous Finals)</h4>
+              <p>
+                Two <em>different</em> aircraft are both inside the short-final zone
+                within overlapping <strong>HOP windows (90 s width, 10 s slide)</strong>. At a
+                two-runway airport like ORY, this indicates a longitudinal separation
+                violation that may warrant ATC intervention.
+              </p>
+              <div class="thresholds">
+                Pattern: two distinct <code>icao24</code> values<br>
+                both satisfying <code>alt &lt; 500 m · on_ground=F</code><br>
+                within the same <code>HOP(90 s, 10 s)</code> window (self-join)
+              </div>
+            </div>
+
+            <div class="atype atype-rga">
+              <h4>🔁 Repeat Go-Around — Persistent Miss Detection</h4>
+              <p>
+                The <em>same</em> aircraft executes two missed approaches within a
+                <strong>30-minute window</strong> — a rare and operationally significant
+                pattern suggesting a persistent obstacle, a crew or systems issue, or
+                severe weather blocking the runway. Detected by chaining a second
+                missed-approach event onto the first via a self-join on the
+                <code>ory_missed_approach</code> stream.
+              </p>
+              <div class="thresholds">
+                Pattern: same <code>icao24</code> across two missed-approach events<br>
+                <code>goaround_2 BETWEEN goaround_1 AND goaround_1 + 30 min</code><br>
+                detected via CEP chaining on <code>ory_missed_approach</code>
+              </div>
+            </div>
+
+            <div class="atype atype-rd">
+              <h4>🔻 Rapid Descent — Emergency Descent Threshold</h4>
+              <p>
+                An airborne aircraft below <strong>2 000 m</strong> records a vertical
+                rate exceeding <strong>−18 m/s (≈ 3 540 ft/min)</strong> — well above a
+                normal approach rate and consistent with an emergency or uncontrolled
+                descent. Detected by a threshold filter applied directly to the enriched
+                ADS-B stream; no temporal pattern is required.
+              </p>
+              <div class="thresholds">
+                <code>baro_altitude &lt; 2 000 m · on_ground=F</code><br>
+                <code>vertical_rate &lt; −18 m/s</code>  (≈ 3 540 ft/min)<br>
+                pure threshold — no event window
+              </div>
+            </div>
+
+            <div class="atype atype-co">
+              <h4>🔵 Corridor Overload — Approach Sector Saturation</h4>
+              <p>
+                Three or more <em>distinct</em> aircraft are simultaneously present
+                inside the ORY approach corridor within the same
+                <strong>30-second tumbling window</strong>. At a two-runway airport this
+                indicates an unusually dense final approach sequence that may exceed
+                ATC separation capacity.
+              </p>
+              <div class="thresholds">
+                <code>COUNT(DISTINCT icao24) ≥ 3</code><br>
+                all satisfying <code>alt &lt; 914 m · on_ground=F</code><br>
+                within the same <code>TUMBLE(30 s)</code> window
+              </div>
+            </div>
+
+          </div>
+
+          <!-- ── Architecture diagram ── -->
+          <h3>🏗 Pipeline Architecture</h3>
+          <div class="diagram">
+            <svg width="820" height="200" viewBox="0 0 820 200" font-family="'Segoe UI',sans-serif" font-size="12">
+              <!-- OpenSky -->
+              <rect x="10"  y="70" width="110" height="60" rx="8" fill="#1c2a3a" stroke="#3b82d4" stroke-width="1.5"/>
+              <text x="65"  y="96"  fill="#79c0ff" text-anchor="middle" font-weight="600">OpenSky</text>
+              <text x="65"  y="112" fill="#8b949e" text-anchor="middle" font-size="10">ADS-B API v2</text>
+              <text x="65"  y="125" fill="#8b949e" text-anchor="middle" font-size="10">OAuth2</text>
+
+              <!-- Arrow 1 -->
+              <line x1="120" y1="100" x2="158" y2="100" stroke="#30363d" stroke-width="1.5" marker-end="url(#arr)"/>
+              <text x="139" y="93"  fill="#8b949e" text-anchor="middle" font-size="10">JSON</text>
+
+              <!-- Producer -->
+              <rect x="160" y="70" width="110" height="60" rx="8" fill="#1a2233" stroke="#58a6ff" stroke-width="1.5"/>
+              <text x="215" y="96"  fill="#58a6ff" text-anchor="middle" font-weight="600">adsb-producer</text>
+              <text x="215" y="112" fill="#8b949e" text-anchor="middle" font-size="10">Python 3.12</text>
+              <text x="215" y="125" fill="#8b949e" text-anchor="middle" font-size="10">kafka-python</text>
+
+              <!-- Simulator (below) -->
+              <rect x="160" y="148" width="110" height="44" rx="8" fill="#1e1433" stroke="#6e40c9" stroke-width="1.5"/>
+              <text x="215" y="168" fill="#bc8cff" text-anchor="middle" font-weight="600">ADS-B Simulation</text>
+              <text x="215" y="183" fill="#8b949e" text-anchor="middle" font-size="10">SIM* events</text>
+              <line x1="215" y1="148" x2="215" y2="131" stroke="#6e40c9" stroke-width="1" stroke-dasharray="4,3"/>
+              <line x1="215" y1="131" x2="270" y2="131" stroke="#6e40c9" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arr2)"/>
+
+              <!-- Arrow 2 -->
+              <line x1="270" y1="100" x2="308" y2="100" stroke="#30363d" stroke-width="1.5" marker-end="url(#arr)"/>
+
+              <!-- Kafka -->
+              <rect x="310" y="55" width="120" height="90" rx="8" fill="#1a1a0d" stroke="#d29922" stroke-width="1.5"/>
+              <text x="370" y="81"  fill="#d29922" text-anchor="middle" font-weight="600">Kafka</text>
+              <text x="370" y="96"  fill="#8b949e" text-anchor="middle" font-size="10">KRaft · 3 topics</text>
+              <text x="370" y="111" fill="#3b82d4" text-anchor="middle" font-size="10">adsb_raw</text>
+              <text x="370" y="124" fill="#f85149" text-anchor="middle" font-size="10">ory_missed_approach</text>
+              <text x="370" y="137" fill="#d29922" text-anchor="middle" font-size="10">ory_twin_landing</text>
+
+              <!-- Arrow 3 -->
+              <line x1="430" y1="100" x2="468" y2="100" stroke="#30363d" stroke-width="1.5" marker-end="url(#arr)"/>
+
+              <!-- Flink -->
+              <rect x="470" y="55" width="130" height="90" rx="8" fill="#0d1a0d" stroke="#3fb950" stroke-width="1.5"/>
+              <text x="535" y="81"  fill="#3fb950" text-anchor="middle" font-weight="600">Apache Flink</text>
+              <text x="535" y="96"  fill="#8b949e" text-anchor="middle" font-size="10">Flink SQL · CEP</text>
+              <text x="535" y="111" fill="#8b949e" text-anchor="middle" font-size="10">MATCH_RECOGNIZE</text>
+              <text x="535" y="126" fill="#8b949e" text-anchor="middle" font-size="10">TUMBLE windows</text>
+              <text x="535" y="141" fill="#8b949e" text-anchor="middle" font-size="10">Watermark 15 s</text>
+
+              <!-- Arrow 4 -->
+              <line x1="600" y1="100" x2="638" y2="100" stroke="#30363d" stroke-width="1.5" marker-end="url(#arr)"/>
+
+              <!-- Dashboard -->
+              <rect x="640" y="70" width="120" height="60" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+              <text x="700" y="96"  fill="#58a6ff" text-anchor="middle" font-weight="600">Dashboard</text>
+              <text x="700" y="112" fill="#8b949e" text-anchor="middle" font-size="10">Flask · this page</text>
+              <text x="700" y="125" fill="#8b949e" text-anchor="middle" font-size="10">OpenShift Route</text>
+
+              <!-- Labels above arrows -->
+              <text x="349" y="48" fill="#8b949e" text-anchor="middle" font-size="10">adsb_raw →</text>
+              <text x="614" y="48" fill="#8b949e" text-anchor="middle" font-size="10">→ alert topics</text>
+
+              <!-- Arrow markers -->
+              <defs>
+                <marker id="arr" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+                  <polygon points="0 0, 8 3, 0 6" fill="#30363d"/>
+                </marker>
+                <marker id="arr2" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+                  <polygon points="0 0, 8 3, 0 6" fill="#6e40c9"/>
+                </marker>
+              </defs>
+            </svg>
+          </div>
+
+          <!-- ── CEP sequence diagrams ── -->
+          <h3>📐 CEP Pattern — Missed Approach (MATCH_RECOGNIZE)</h3>
+          <div class="diagram">
+            <svg width="780" height="160" viewBox="0 0 780 160" font-family="'Segoe UI',sans-serif" font-size="11">
+              <!-- Timeline -->
+              <line x1="40" y1="80" x2="750" y2="80" stroke="#30363d" stroke-width="1"/>
+              <text x="40" y="100" fill="#8b949e">t₀</text>
+              <!-- Events on timeline -->
+              <!-- A: first approach event -->
+              <circle cx="130" cy="80" r="10" fill="#1a0d0d" stroke="#f85149" stroke-width="2"/>
+              <text x="130" y="84" fill="#f85149" text-anchor="middle" font-weight="700">A</text>
+              <text x="130" y="58" fill="#8b949e" text-anchor="middle">alt 880 m</text>
+              <text x="130" y="68" fill="#8b949e" text-anchor="middle">vrate −4</text>
+
+              <!-- B: continuing descent -->
+              <circle cx="270" cy="80" r="10" fill="#1a0d0d" stroke="#8b949e" stroke-width="1.5"/>
+              <text x="270" y="84" fill="#8b949e" text-anchor="middle" font-weight="700">B</text>
+              <text x="270" y="58" fill="#8b949e" text-anchor="middle">alt 650 m</text>
+              <text x="270" y="68" fill="#8b949e" text-anchor="middle">vrate −1.5</text>
+
+              <circle cx="370" cy="80" r="10" fill="#1a0d0d" stroke="#8b949e" stroke-width="1.5"/>
+              <text x="370" y="84" fill="#8b949e" text-anchor="middle" font-weight="700">B</text>
+              <text x="370" y="58" fill="#8b949e" text-anchor="middle">alt 600 m</text>
+              <text x="370" y="68" fill="#8b949e" text-anchor="middle">vrate −1.5</text>
+
+              <!-- C: go-around -->
+              <circle cx="510" cy="80" r="10" fill="#0d1a0d" stroke="#3fb950" stroke-width="2"/>
+              <text x="510" y="84" fill="#3fb950" text-anchor="middle" font-weight="700">C</text>
+              <text x="510" y="58" fill="#8b949e" text-anchor="middle">alt 420 m</text>
+              <text x="510" y="68" fill="#3fb950" text-anchor="middle">vrate +5</text>
+
+              <circle cx="620" cy="80" r="10" fill="#0d1a0d" stroke="#3fb950" stroke-width="2"/>
+              <text x="620" y="84" fill="#3fb950" text-anchor="middle" font-weight="700">C</text>
+              <text x="620" y="58" fill="#8b949e" text-anchor="middle">alt 800 m</text>
+              <text x="620" y="68" fill="#3fb950" text-anchor="middle">vrate +5</text>
+
+              <!-- MATCH bracket -->
+              <line x1="120" y1="112" x2="630" y2="112" stroke="#f85149" stroke-width="1" stroke-dasharray="4,3"/>
+              <line x1="120" y1="108" x2="120" y2="116" stroke="#f85149" stroke-width="1"/>
+              <line x1="630" y1="108" x2="630" y2="116" stroke="#f85149" stroke-width="1"/>
+              <text x="375" y="128" fill="#f85149" text-anchor="middle" font-size="11">MATCH fired → ory_missed_approach</text>
+
+              <!-- Window bracket -->
+              <rect x="90" y="135" width="580" height="18" rx="3" fill="none" stroke="#30363d" stroke-width="1" stroke-dasharray="3,3"/>
+              <text x="380" y="148" fill="#8b949e" text-anchor="middle" font-size="10">PATTERN window: 10 minutes</text>
+            </svg>
+          </div>
+
+          <h3>📐 CEP Pattern — Twin Landing (HOP window self-join)</h3>
+          <div class="diagram">
+            <svg width="780" height="170" viewBox="0 0 780 170" font-family="'Segoe UI',sans-serif" font-size="11">
+              <!-- 5-min window box -->
+              <rect x="80" y="20" width="560" height="130" rx="6" fill="none" stroke="#d29922" stroke-width="1" stroke-dasharray="5,3"/>
+              <text x="90" y="36" fill="#d29922" font-size="10">HOP window · 90 s width / 10 s slide</text>
+
+              <!-- Aircraft A timeline -->
+              <line x1="100" y1="75" x2="620" y2="75" stroke="#30363d" stroke-width="1"/>
+              <text x="60" y="79" fill="#58a6ff">SIM002</text>
+              <circle cx="180" cy="75" r="9" fill="#1a0d0d" stroke="#58a6ff" stroke-width="2"/>
+              <text x="180" y="79" fill="#58a6ff" text-anchor="middle" font-size="10">A</text>
+              <text x="180" y="60" fill="#8b949e" text-anchor="middle">760 m</text>
+              <circle cx="350" cy="75" r="9" fill="#1a0d0d" stroke="#58a6ff" stroke-width="2"/>
+              <text x="350" y="79" fill="#58a6ff" text-anchor="middle" font-size="10">A</text>
+              <text x="350" y="60" fill="#8b949e" text-anchor="middle">610 m</text>
+
+              <!-- Aircraft B timeline -->
+              <line x1="100" y1="118" x2="620" y2="118" stroke="#30363d" stroke-width="1"/>
+              <text x="60" y="122" fill="#bc8cff">SIM003</text>
+              <circle cx="240" cy="118" r="9" fill="#1a1500" stroke="#bc8cff" stroke-width="2"/>
+              <text x="240" y="122" fill="#bc8cff" text-anchor="middle" font-size="10">B</text>
+              <text x="240" y="105" fill="#8b949e" text-anchor="middle">810 m</text>
+              <circle cx="430" cy="118" r="9" fill="#1a1500" stroke="#bc8cff" stroke-width="2"/>
+              <text x="430" y="122" fill="#bc8cff" text-anchor="middle" font-size="10">B</text>
+              <text x="430" y="105" fill="#8b949e" text-anchor="middle">690 m</text>
+
+              <!-- match line -->
+              <line x1="100" y1="155" x2="640" y2="155" stroke="#d29922" stroke-width="1" stroke-dasharray="4,3"/>
+              <text x="370" y="168" fill="#d29922" text-anchor="middle">JOIN on window → MATCH → ory_twin_landing</text>
+            </svg>
+          </div>
+
+          <!-- ── Technology stack ── -->
+          <h3>🔧 Technology Stack</h3>
+          <div class="pills">
+            <div class="pill"><span>Apache Kafka 3.7</span> · KRaft single-node broker</div>
+            <div class="pill"><span>Apache Flink 1.19</span> · Flink SQL + MATCH_RECOGNIZE</div>
+            <div class="pill"><span>Confluent Schema Registry 7.9</span></div>
+            <div class="pill"><span>OpenSky Network API v2</span> · ADS-B state vectors</div>
+            <div class="pill"><span>Python 3.12</span> · producer, simulator, dashboard</div>
+            <div class="pill"><span>Flask</span> · dashboard web server</div>
+            <div class="pill"><span>OpenShift / CRC</span> · Kubernetes platform</div>
+          </div>
+
+          <!-- ── Data sources ── -->
+          <h3>📡 Data Sources &amp; Reference Data</h3>
+          <ul>
+            <li><strong>OpenSky Network</strong> — live ADS-B state vectors polled every 60 s
+                for bounding box <code>48.10–49.15°N / 1.90–2.90°E</code> (±50 NM around ORY)</li>
+            <li><strong>aircraft_lookup_fr.csv</strong> — French aircraft registry:
+                maps <code>icao24</code> hex codes to airline, type, registration</li>
+            <li><strong>flight_route_ory.csv</strong> — ORY route table:
+                maps callsigns to origin–destination pairs</li>
+            <li><strong>ADS-B Simulation</strong> — synthetic events with <code>icao24</code>
+                prefixed <code>SIM*</code>; cycles MA → TW → RD → CO
+                every 20 s to keep the dashboard active during low-traffic periods</li>
+          </ul>
+
+          <!-- ── Kubernetes resources ── -->
+          <h3>☸ Kubernetes Workloads (<code>plane-track</code> namespace)</h3>
+          <ul>
+            <li><code>broker</code> — Kafka KRaft Deployment + ClusterIP Service (9092 / 29092)</li>
+            <li><code>schema-registry</code> — Confluent Schema Registry
+                (<code>enableServiceLinks: false</code> to avoid SCHEMA_REGISTRY_PORT injection)</li>
+            <li><code>flink-jobmanager</code> — Flink JM, REST 9081, RPC 6123, BLOB 6124;
+                includes <code>sql-resubmit-watchdog</code> sidecar that auto-submits all 5 CEP jobs</li>
+            <li><code>flink-taskmanager</code> — 10 task slots</li>
+            <li><code>adsb-producer</code> — polls OpenSky, publishes to <code>adsb_raw</code></li>
+            <li><code>ADS-B Simulator</code> — synthetic <code>SIM*</code> events for demo / testing</li>
+            <li><code>alerts-dashboard</code> — this Flask app, exposed via OpenShift Route (TLS edge)</li>
+          </ul>
+
+        </div>
+      </div><!-- /tab-about -->
+
+      <!-- ══════════════════════ POPOVERS ══════════════════════ -->
+
+      <!-- Missed Approach popover -->
+      <div class="popover" id="pop-ma">
+        <h4 style="color:#f85149">🔴 Missed Approach — Go-Around Detection</h4>
+        <p>An aircraft enters the ORY final approach corridor (below <strong>3 000 ft / 914 m</strong>, descending) but then climbs away without touching down — detected by Flink <code>MATCH_RECOGNIZE</code> within a 10-minute event window.</p>
+        <svg width="288" height="110" viewBox="0 0 288 110" font-family="Segoe UI,sans-serif" font-size="9" style="display:block;margin:8px 0">
+          <defs>
+            <marker id="pa" markerWidth="6" markerHeight="5" refX="5" refY="2.5" orient="auto">
+              <polygon points="0 0,6 2.5,0 5" fill="#8b949e"/>
+            </marker>
+          </defs>
+          <!-- runway -->
+          <rect x="10" y="88" width="268" height="6" rx="2" fill="#21262d"/>
+          <text x="144" y="104" fill="#8b949e" text-anchor="middle">Runway 06/24</text>
+          <!-- approach ceiling -->
+          <line x1="10" y1="18" x2="278" y2="18" stroke="#30363d" stroke-dasharray="4,3" stroke-width="1"/>
+          <text x="281" y="21" fill="#8b949e">914 m</text>
+          <!-- flight path: descend then go-around -->
+          <polyline points="10,12 80,38 130,55 160,68 190,80 210,72 230,55 255,30 278,10"
+                    fill="none" stroke="#f85149" stroke-width="2"/>
+          <!-- labels -->
+          <text x="12"  y="10" fill="#8b949e">A</text>
+          <circle cx="10" cy="12" r="4" fill="#f85149"/>
+          <text x="160" y="65" fill="#8b949e" text-anchor="middle">B</text>
+          <circle cx="155" cy="68" r="4" fill="#8b949e"/>
+          <text x="255" y="27" fill="#3fb950">C ↑</text>
+          <circle cx="255" cy="30" r="4" fill="#3fb950"/>
+          <text x="144" y="50" fill="#f85149" text-anchor="middle" font-size="8">— go-around —</text>
+        </svg>
+        <div class="pop-rules">
+          A: alt &lt; 914 m · vrate &lt; −1 m/s · not on ground<br>
+          B: alt &lt; 914 m · vrate ≤ 2 m/s  · not on ground<br>
+          C: alt &gt; 200 m · vrate &gt; 2 m/s  · not on ground<br>
+          Window: 10 minutes
+        </div>
+      </div>
+
+      <!-- Twin Landing popover -->
+      <div class="popover" id="pop-tw">
+        <h4 style="color:#d29922">🟡 Twin Landing — Simultaneous Finals</h4>
+        <p>Two <em>different</em> aircraft are both inside the short-final zone (below 500 m) on the same approach axis within the same <strong>90-second HOP window</strong>. This indicates a longitudinal separation violation and may signal an ATC incident.</p>
+        <svg width="288" height="110" viewBox="0 0 288 110" font-family="Segoe UI,sans-serif" font-size="9" style="display:block;margin:8px 0">
+          <defs>
+            <marker id="pb" markerWidth="6" markerHeight="5" refX="5" refY="2.5" orient="auto">
+              <polygon points="0 0,6 2.5,0 5" fill="#8b949e"/>
+            </marker>
+          </defs>
+          <!-- runway -->
+          <rect x="10" y="88" width="268" height="6" rx="2" fill="#21262d"/>
+          <text x="144" y="104" fill="#8b949e" text-anchor="middle">Runway 06/24</text>
+          <!-- approach ceiling -->
+          <line x1="10" y1="18" x2="278" y2="18" stroke="#30363d" stroke-dasharray="4,3" stroke-width="1"/>
+          <text x="281" y="21" fill="#8b949e">914 m</text>
+          <!-- Aircraft A descent (blue) -->
+          <polyline points="10,14 80,32 150,52 210,72 260,85"
+                    fill="none" stroke="#58a6ff" stroke-width="2"/>
+          <circle cx="10"  cy="14" r="4" fill="#58a6ff"/>
+          <circle cx="150" cy="52" r="4" fill="#58a6ff"/>
+          <text x="155" y="48" fill="#58a6ff">A</text>
+          <!-- Aircraft B descent (purple) — slightly behind -->
+          <polyline points="40,12 110,28 180,46 240,66 278,82"
+                    fill="none" stroke="#bc8cff" stroke-width="2" stroke-dasharray="5,3"/>
+          <circle cx="40"  cy="12" r="4" fill="#bc8cff"/>
+          <circle cx="180" cy="46" r="4" fill="#bc8cff"/>
+          <text x="185" y="43" fill="#bc8cff">B</text>
+          <!-- 5-min window bracket -->
+          <rect x="60" y="6" width="200" height="78" rx="4" fill="none" stroke="#d29922" stroke-width="1" stroke-dasharray="4,3"/>
+          <text x="160" y="14" fill="#d29922" text-anchor="middle" font-size="8">HOP 90 s — both inside</text>
+        </svg>
+        <div class="pop-rules">
+          Two distinct icao24 values<br>
+          both: alt &lt; 500 m · not on ground<br>
+          within the same HOP(90 s width, 10 s slide) window<br>
+          detected via self-join
+        </div>
+      </div>
+
+      <!-- Repeat Go-Around popover -->
+      <div class="popover" id="pop-rga">
+        <h4 style="color:#ff7b72">🔁 Repeat Go-Around — Persistent Miss Detection</h4>
+        <p>The <em>same</em> aircraft executes two missed approaches within a <strong>30-minute window</strong> — a rare and operationally significant pattern suggesting a persistent obstacle, a crew or systems issue, or severe weather blocking the runway. Detected by chaining a second missed-approach event onto the first via a self-join on the <code>ory_missed_approach</code> stream.</p>
+        <svg width="288" height="110" viewBox="0 0 288 110" font-family="Segoe UI,sans-serif" font-size="9" style="display:block;margin:8px 0">
+          <!-- runway -->
+          <rect x="10" y="88" width="268" height="6" rx="2" fill="#21262d"/>
+          <text x="144" y="104" fill="#8b949e" text-anchor="middle">Runway 06/24</text>
+          <!-- approach ceiling -->
+          <line x1="10" y1="28" x2="278" y2="28" stroke="#30363d" stroke-dasharray="4,3" stroke-width="1"/>
+          <text x="281" y="31" fill="#8b949e">914 m</text>
+          <!-- 30-min window bracket -->
+          <rect x="10" y="6" width="268" height="78" rx="4" fill="none" stroke="#ff7b72" stroke-width="1" stroke-dasharray="4,3"/>
+          <text x="144" y="14" fill="#ff7b72" text-anchor="middle" font-size="8">same icao24 — within 30 min</text>
+          <!-- Go-around #1: descend then climb -->
+          <polyline points="20,22 55,42 75,58 90,70 100,60 112,38 122,22"
+                    fill="none" stroke="#ff7b72" stroke-width="2"/>
+          <circle cx="20"  cy="22" r="3" fill="#ff7b72"/>
+          <circle cx="122" cy="22" r="3" fill="#ff7b72"/>
+          <text x="68" y="76" fill="#ff7b72" text-anchor="middle" font-size="8">miss #1</text>
+          <!-- Go-around #2: later, same aircraft -->
+          <polyline points="158,22 193,42 213,58 228,70 238,60 250,38 262,22"
+                    fill="none" stroke="#ffadad" stroke-width="2" stroke-dasharray="5,3"/>
+          <circle cx="158" cy="22" r="3" fill="#ffadad"/>
+          <circle cx="262" cy="22" r="3" fill="#ffadad"/>
+          <text x="210" y="76" fill="#ffadad" text-anchor="middle" font-size="8">miss #2</text>
+        </svg>
+        <div class="pop-rules">
+          Same icao24 across two missed-approach events<br>
+          goaround_2 BETWEEN goaround_1 AND goaround_1 + 30 min<br>
+          detected via CEP chaining on ory_missed_approach
+        </div>
+      </div>
+
+      <!-- Rapid Descent popover -->
+      <div class="popover" id="pop-rd">
+        <h4 style="color:#ff6b35">🔻 Rapid Descent — Emergency Descent Threshold</h4>
+        <p>An airborne aircraft below <strong>2 000 m</strong> records a vertical rate exceeding <strong>−18 m/s (≈ 3 540 ft/min)</strong> — well above a normal approach rate and consistent with an emergency or uncontrolled descent. Detected by a threshold filter applied directly to the enriched ADS-B stream; no temporal pattern is required.</p>
+        <svg width="288" height="110" viewBox="0 0 288 110" font-family="Segoe UI,sans-serif" font-size="9" style="display:block;margin:8px 0">
+          <!-- ground -->
+          <rect x="10" y="88" width="268" height="6" rx="2" fill="#21262d"/>
+          <text x="144" y="104" fill="#8b949e" text-anchor="middle">Ground level</text>
+          <!-- 2000 m ceiling -->
+          <line x1="10" y1="12" x2="278" y2="12" stroke="#30363d" stroke-dasharray="4,3" stroke-width="1"/>
+          <text x="281" y="15" fill="#8b949e">2 000 m</text>
+          <!-- threshold line at −15 m/s annotation -->
+          <line x1="10" y1="50" x2="278" y2="50" stroke="#ff6b35" stroke-dasharray="3,3" stroke-width="1"/>
+          <text x="12" y="47" fill="#ff6b35" font-size="8">−18 m/s threshold</text>
+          <!-- normal descent (shallow, grey) -->
+          <polyline points="20,14 120,55 180,72 240,84"
+                    fill="none" stroke="#30363d" stroke-width="1.5" stroke-dasharray="4,3"/>
+          <text x="60" y="26" fill="#8b949e" font-size="8">normal</text>
+          <!-- rapid descent (steep, orange) -->
+          <polyline points="120,14 155,38 175,58 195,75 210,84"
+                    fill="none" stroke="#ff6b35" stroke-width="2.5"/>
+          <circle cx="120" cy="14" r="4" fill="#ff6b35"/>
+          <circle cx="195" cy="75" r="4" fill="#ff6b35"/>
+          <text x="220" y="38" fill="#ff6b35" font-size="8">rapid ↓</text>
+          <!-- alert flash marker -->
+          <circle cx="155" cy="38" r="5" fill="none" stroke="#ff6b35" stroke-width="1.5"/>
+          <text x="164" y="42" fill="#ff6b35" font-size="8">⚡</text>
+        </svg>
+        <div class="pop-rules">
+          baro_altitude &lt; 2 000 m · not on ground<br>
+          vertical_rate &lt; −18 m/s  (≈ 3 540 ft/min)<br>
+          pure threshold — no event window
+        </div>
+      </div>
+
+      <!-- Corridor Overload popover -->
+      <div class="popover" id="pop-co">
+        <h4 style="color:#79c0ff">🔵 Corridor Overload — Approach Sector Saturation</h4>
+        <p>Three or more <em>distinct</em> aircraft are simultaneously present inside the ORY approach corridor within the same <strong>30-second tumbling window</strong>. At a two-runway airport this indicates an unusually dense final approach sequence that may exceed ATC separation capacity.</p>
+        <svg width="288" height="110" viewBox="0 0 288 110" font-family="Segoe UI,sans-serif" font-size="9" style="display:block;margin:8px 0">
+          <!-- runway -->
+          <rect x="10" y="88" width="268" height="6" rx="2" fill="#21262d"/>
+          <text x="144" y="104" fill="#8b949e" text-anchor="middle">Runway 06/24</text>
+          <!-- approach ceiling -->
+          <line x1="10" y1="18" x2="278" y2="18" stroke="#30363d" stroke-dasharray="4,3" stroke-width="1"/>
+          <text x="281" y="21" fill="#8b949e">914 m</text>
+          <!-- 5-min window bracket -->
+          <rect x="30" y="6" width="228" height="78" rx="4" fill="none" stroke="#79c0ff" stroke-width="1" stroke-dasharray="4,3"/>
+          <text x="144" y="14" fill="#79c0ff" text-anchor="middle" font-size="8">TUMBLE 30 s — 3+ inside</text>
+          <!-- Aircraft A -->
+          <polyline points="35,16 100,36 170,58 230,78 268,86"
+                    fill="none" stroke="#58a6ff" stroke-width="2"/>
+          <circle cx="35"  cy="16" r="3" fill="#58a6ff"/>
+          <text x="40" y="28" fill="#58a6ff">A</text>
+          <!-- Aircraft B -->
+          <polyline points="60,14 125,32 195,52 250,72 275,83"
+                    fill="none" stroke="#bc8cff" stroke-width="2" stroke-dasharray="5,3"/>
+          <circle cx="60"  cy="14" r="3" fill="#bc8cff"/>
+          <text x="65" y="26" fill="#bc8cff">B</text>
+          <!-- Aircraft C -->
+          <polyline points="90,12 155,28 215,48 258,66"
+                    fill="none" stroke="#79c0ff" stroke-width="2" stroke-dasharray="2,3"/>
+          <circle cx="90"  cy="12" r="3" fill="#79c0ff"/>
+          <text x="95" y="24" fill="#79c0ff">C</text>
+        </svg>
+        <div class="pop-rules">
+          COUNT(DISTINCT icao24) ≥ 3<br>
+          all satisfying: baro_altitude &lt; 914 m · not on ground<br>
+          within the same TUMBLE(30 s) window
+        </div>
+      </div>
+
+      <!-- ══════════════════════ DRAWER ══════════════════════ -->
+      <div class="drawer-overlay" id="drawerOverlay" onclick="closeDrawer()"></div>
+      <div class="drawer" id="drawer">
+        <div class="drawer-header">
+          <h2 id="drawerTitle">Alert Details</h2>
+          <button class="drawer-close" onclick="closeDrawer()">✕</button>
+        </div>
+        <div class="drawer-body" id="drawerBody">
+          <p class="loading">Loading…</p>
+        </div>
+      </div>
+
+      <script>
+        /* ── Tab switching ── */
+        function showTab(name) {
+          document.querySelectorAll('.tabcontent').forEach(function(t){ t.classList.remove('active'); });
+          document.querySelectorAll('.tab').forEach(function(t){ t.classList.remove('active'); });
+          document.getElementById('tab-' + name).classList.add('active');
+          document.getElementById('tab-btn-' + name).classList.add('active');
+        }
+
+        /* ── Per-panel active filter state ── */
+        var _filter = { sim: 'all', live: 'all' };
+
+        /* ── Filter chip click handler ── */
+        document.querySelectorAll('.fchip[data-filter]').forEach(function(chip) {
+          chip.addEventListener('click', function(e) {
+            // Don't trigger filter when clicking the ? info button
+            if (e.target.classList.contains('fchip-info')) return;
+            var panel  = chip.dataset.panel;
+            var filter = chip.dataset.filter;
+            _filter[panel] = filter;
+            // Update active state within this panel's bar
+            document.querySelectorAll('.fchip[data-panel="' + panel + '"]').forEach(function(c) {
+              c.classList.toggle('active', c.dataset.filter === filter);
+            });
+            renderCards(_alertsData);
+          });
+        });
+
+        /* ── Popover logic (? info buttons) ── */
+        var _openPop = null;
+        document.querySelectorAll('.fchip-info').forEach(function(btn) {
+          btn.addEventListener('click', function(e) {
+            e.stopPropagation();
+            var popId = btn.dataset.pop;
+            var pop   = document.getElementById(popId);
+            if (!pop) return;
+            if (_openPop && _openPop !== pop) { _openPop.classList.remove('open'); }
+            if (pop.classList.contains('open')) {
+              pop.classList.remove('open');
+              _openPop = null;
+              return;
+            }
+            // Position near the button, avoid viewport edge
+            var r = btn.getBoundingClientRect();
+            var left = Math.min(r.left, window.innerWidth - 340);
+            var top  = r.bottom + 6;
+            if (top + 300 > window.innerHeight) top = r.top - 306;
+            pop.style.left = left + 'px';
+            pop.style.top  = top  + 'px';
+            pop.classList.add('open');
+            _openPop = pop;
+          });
+        });
+        document.addEventListener('click', function() {
+          if (_openPop) { _openPop.classList.remove('open'); _openPop = null; }
+        });
+
+        /* ── In-memory alert cache (updated by poll) ── */
+        var _alertsData = [];
+        /* Track highest _id seen so we know which cards are new since last render */
+        var _lastSeenId = 0;
+
+        /* ── Topic → card/badge/filter key mapping ── */
+        var _TOPIC_META = {
+          'ory_missed_approach':   { cls:'card-missed', badge:'badge-missed', key:'ma', label:'🔴 MISSED APPROACH' },
+          'ory_twin_landing':      { cls:'card-twin',   badge:'badge-twin',   key:'tw', label:'🟡 TWIN LANDING' },
+          'ory_repeated_goaround': { cls:'card-rga',    badge:'badge-rga',    key:'rga',label:'🔁 REPEAT GO-AROUND' },
+          'ory_rapid_descent':     { cls:'card-rd',     badge:'badge-rd',     key:'rd', label:'🔻 RAPID DESCENT' },
+          'ory_corridor_overload': { cls:'card-co',     badge:'badge-co',     key:'co', label:'🔵 CORRIDOR OVERLOAD' },
+        };
+
+        /* ── Interleave all topic buckets round-robin ── */
+        function interleave(alerts) {
+          var buckets = {}, order = ['ory_missed_approach','ory_twin_landing',
+            'ory_repeated_goaround','ory_rapid_descent','ory_corridor_overload'];
+          order.forEach(function(t){ buckets[t] = []; });
+          alerts.forEach(function(a){
+            if (buckets[a._topic]) buckets[a._topic].push(a);
+            else buckets['ory_missed_approach'].push(a); // fallback
+          });
+          var out = [], more = true;
+          while (more) {
+            more = false;
+            order.forEach(function(t){
+              if (buckets[t].length) { out.push(buckets[t].shift()); more = true; }
+            });
+          }
+          return out;
+        }
+
+        /* ── Apply topic filter for a panel ── */
+        function applyFilter(alerts, panel) {
+          var f = _filter[panel];
+          if (f === 'all') return alerts;
+          return alerts.filter(function(a){
+            var meta = _TOPIC_META[a._topic];
+            return meta && meta.key === f;
+          });
+        }
+
+        /* ── Age string: "5 s ago", "2 min ago" etc. ── */
+        function ageStr(epoch) {
+          if (!epoch) return '';
+          var secs = Math.round(Date.now() / 1000 - epoch);
+          if (secs < 5)   return 'just now';
+          if (secs < 60)  return secs + ' s ago';
+          if (secs < 3600) return Math.floor(secs / 60) + ' min ago';
+          return Math.floor(secs / 3600) + ' h ago';
+        }
+
+        /* ── Render alert cards into the two panel divs ── */
+        function renderCards(alerts) {
+          // Twin Landing is excluded from Live: at a dual-runway airport like Orly, two
+          // aircraft simultaneously on parallel finals is normal operations, not an anomaly.
+          // It is kept in Simulated where it demonstrates the CEP pattern as intended.
+          var liveAll = interleave(alerts.filter(function(a){
+            return !a._simulated && a._topic !== 'ory_twin_landing';
+          }));
+          var simAll  = interleave(alerts.filter(function(a){ return  a._simulated; }));
+          var live = applyFilter(liveAll, 'live');
+          var sim  = applyFilter(simAll,  'sim');
+
+          document.getElementById('count-live').textContent = live.length + ' event(s)';
+          document.getElementById('count-sim').textContent  = sim.length  + ' event(s)';
+
+          document.getElementById('panel-live-cards').innerHTML =
+            live.length ? live.map(cardHTML).join('') : '<p class="empty">No live alerts yet — waiting for real ORY traffic…</p>';
+          document.getElementById('panel-sim-cards').innerHTML =
+            sim.length  ? sim.map(cardHTML).join('')  : '<p class="empty">No simulated alerts yet — simulator starting up…</p>';
+
+          /* Wire details buttons after injecting HTML */
+          document.querySelectorAll('button.details-link').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+              openDrawer(parseInt(btn.dataset.id, 10));
+            });
+          });
+
+          /* Update tab badges — separate counts per panel */
+          var badgeSim  = document.getElementById('tab-badge-sim');
+          var badgeLive = document.getElementById('tab-badge-live');
+          if (badgeSim)  { badgeSim.textContent  = sim.length;  badgeSim.classList.toggle('empty',  sim.length  === 0); }
+          if (badgeLive) { badgeLive.textContent = live.length; badgeLive.classList.toggle('empty', live.length === 0); }
+        }
+
+        function cardHTML(a) {
+          var meta = _TOPIC_META[a._topic] || _TOPIC_META['ory_missed_approach'];
+          var isNew   = a._id > _lastSeenId;
+          var newCls  = isNew ? ' card-new' : '';
+          var ts      = a._received_at || '';
+          var age     = a._received_epoch ? '<span class="card-age" data-epoch="' + a._received_epoch + '">' + ageStr(a._received_epoch) + '</span>' : '';
+          var body    = '';
+          var topic   = a._topic;
+
+          if (topic === 'ory_missed_approach') {
+            var cs  = a.callsign || a.icao24 || '—';
+            var alt = a.approach_alt != null ? Math.round(a.approach_alt) + ' m' : '—';
+            var vr  = a.go_around_alt != null ? Math.round(a.go_around_alt) + ' m' : '—';
+            body = '<strong>' + cs + '</strong>' +
+              ' <span class="muted">approach ' + alt + ' · go-around ' + vr + '</span>';
+          } else if (topic === 'ory_twin_landing') {
+            var csA = a.callsign_a || a.icao24_a || '—';
+            var csB = a.callsign_b || a.icao24_b || '—';
+            var altA = a.alt_a != null ? Math.round(a.alt_a) + ' m' : '—';
+            var altB = a.alt_b != null ? Math.round(a.alt_b) + ' m' : '—';
+            body = '<strong>' + csA + '</strong> &amp; <strong>' + csB + '</strong>' +
+              ' <span class="muted">alts ' + altA + ' / ' + altB + '</span>';
+          } else if (topic === 'ory_repeated_goaround') {
+            var cs2 = a.callsign || a.icao24 || '—';
+            var t1  = a.goaround_1 ? a.goaround_1.slice(11,16) : '—';
+            var t2  = a.goaround_2 ? a.goaround_2.slice(11,16) : '—';
+            body = '<strong>' + cs2 + '</strong>' +
+              ' <span class="muted">go-arounds at ' + t1 + ' &amp; ' + t2 + '</span>';
+          } else if (topic === 'ory_rapid_descent') {
+            var cs3  = a.callsign || a.icao24 || '—';
+            var alt3 = a.baro_altitude != null ? Math.round(a.baro_altitude) + ' m' : '—';
+            var vr3  = a.vertical_rate != null ? a.vertical_rate.toFixed(1) + ' m/s' : '—';
+            body = '<strong>' + cs3 + '</strong>' +
+              ' <span class="muted">alt ' + alt3 + ' · vrate ' + vr3 + '</span>';
+          } else if (topic === 'ory_corridor_overload') {
+            var cnt = a.aircraft_count || '?';
+            var ws  = a.window_start ? a.window_start.slice(11,16) : '—';
+            var we  = a.window_end   ? a.window_end.slice(11,16)   : '—';
+            body = '<strong>' + cnt + ' aircraft</strong>' +
+              ' <span class="muted">in corridor ' + ws + '–' + we + '</span>';
+          }
+
+          return '<div class="card ' + meta.cls + newCls + '">' +
+            '<div class="card-line1">' +
+              '<span class="badge ' + meta.badge + '">' + meta.label + '</span>' +
+              '<span class="card-body">' + body + '</span>' +
+              '<span class="card-ts">' + ts + '</span>' +
+              age +
+              '<span class="card-sep">·</span>' +
+              '<button class="details-link" data-id="' + a._id + '">View details →</button>' +
+            '</div>' +
+          '</div>';
+        }
+
+        /* ── Age counter — tick every second to update all visible age spans ── */
+        setInterval(function() {
+          document.querySelectorAll('.card-age[data-epoch]').forEach(function(el) {
+            el.textContent = ageStr(parseFloat(el.dataset.epoch));
+          });
+        }, 1000);
+
+        /* ── Flight Events raw polling ── */
+        var _rawPollTimer = null;
+        function pollRaw() {
+          fetch('/api/raw')
+            .then(function(r){ return r.json(); })
+            .then(function(data){ renderRaw(data); })
+            .catch(function(){});
+        }
+        function renderRaw(rows) {
+          var tbody = document.getElementById('ev-tbody');
+          if (!tbody) return;
+          if (!rows || rows.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="10" style="padding:30px;text-align:center;color:#8b949e">No data yet — waiting for ADS-B vectors…</td></tr>';
+            document.getElementById('ev-count').textContent   = '—';
+            document.getElementById('ev-approach').textContent = '—';
+            document.getElementById('ev-ground').textContent  = '—';
+            document.getElementById('ev-ts').textContent      = '—';
+            return;
+          }
+          var tracked  = rows.length;
+          var approach = rows.filter(function(r){ return r.baro_altitude != null && r.baro_altitude < 914 && !r.on_ground; }).length;
+          var ground   = rows.filter(function(r){ return r.on_ground; }).length;
+          document.getElementById('ev-count').textContent   = tracked;
+          document.getElementById('ev-approach').textContent = approach;
+          document.getElementById('ev-ground').textContent  = ground;
+          document.getElementById('ev-ts').textContent      = rows[0]._received_at || '—';
+
+          /* Build icao24 → alert-type map from current alerts for row highlighting */
+          var alertIcao = {};
+          _alertsData.forEach(function(a) {
+            var ids = [a.icao24, a.icao24_a, a.icao24_b].filter(Boolean);
+            ids.forEach(function(id) {
+              /* Priority: MA > RD > RGA > TW > CO */
+              var existing = alertIcao[id];
+              var t = a._topic;
+              if (!existing ||
+                  (t === 'ory_missed_approach') ||
+                  (t === 'ory_rapid_descent'   && existing !== 'ory_missed_approach') ||
+                  (t === 'ory_repeated_goaround' && existing !== 'ory_missed_approach' && existing !== 'ory_rapid_descent')) {
+                alertIcao[id] = t;
+              }
+            });
+          });
+
+          function rowHighlight(icao24) {
+            var t = alertIcao[icao24];
+            if (!t) return '';
+            if (t === 'ory_missed_approach' || t === 'ory_rapid_descent' || t === 'ory_repeated_goaround')
+              return 'background:rgba(248,81,73,.10) !important;';
+            if (t === 'ory_twin_landing' || t === 'ory_corridor_overload')
+              return 'background:rgba(210,153,34,.08) !important;';
+            return '';
+          }
+
+          function fmt(v, dec) {
+            if (v == null) return '<span style="color:#57606a">—</span>';
+            return parseFloat(v).toFixed(dec != null ? dec : 0);
+          }
+          function mToFt(m) { return m != null ? Math.round(m * 3.28084) + ' ft' : ''; }
+          function msToKt(ms) { return ms != null ? Math.round(ms * 1.94384) : null; }
+
+          function altStyle(r) {
+            if (r.on_ground) return 'color:#3fb950';
+            if (r.baro_altitude != null && r.baro_altitude < 914) return 'color:#f85149;font-weight:600';
+            return 'color:#e6edf3';
+          }
+          function vrStyle(v) {
+            if (v == null) return '';
+            if (v > 2)  return 'color:#3fb950';
+            if (v < -2) return 'color:#f85149';
+            return 'color:#8b949e';
+          }
+          function statusBadge(r) {
+            if (r.on_ground) return '<span style="background:#1a3a1a;color:#3fb950;font-size:9px;padding:1px 6px;border-radius:3px;font-weight:700">GND</span>';
+            if (r.baro_altitude != null && r.baro_altitude < 914)
+              return '<span style="background:#3a1212;color:#f85149;font-size:9px;padding:1px 6px;border-radius:3px;font-weight:700">APPR</span>';
+            return '<span style="background:#1a2233;color:#58a6ff;font-size:9px;padding:1px 6px;border-radius:3px;font-weight:700">ENRT</span>';
+          }
+
+          var TR = '#0d1117', TR_ALT = '#111820';
+          tbody.innerHTML = rows.map(function(r, i) {
+            var bg = i % 2 === 0 ? TR : TR_ALT;
+            var hl = rowHighlight((r.icao24 || '').toUpperCase());
+            var rowStyle = hl ? hl : ('background:' + bg + ';');
+            var cs = (r.callsign || r.icao24 || '—').trim();
+            var isSimulated = cs.startsWith('SIM') || (r.icao24 || '').toUpperCase().startsWith('SIM');
+            var csStyle = isSimulated ? 'color:#bc8cff' : 'color:#e6edf3';
+            return '<tr style="' + rowStyle + 'border-bottom:1px solid #161b22">' +
+              '<td style="padding:6px 10px;' + csStyle + ';font-weight:600">' + cs + '</td>' +
+              '<td style="padding:6px 10px;color:#57606a;font-size:11px">' + (r.icao24 || '—') + '</td>' +
+              '<td style="padding:6px 10px;color:#8b949e">' + (r.origin_country || '—') + '</td>' +
+              '<td style="padding:6px 10px;text-align:right;' + altStyle(r) + '" title="' + mToFt(r.baro_altitude) + '">' +
+                fmt(r.baro_altitude) + '</td>' +
+              '<td style="padding:6px 10px;text-align:right;' + vrStyle(r.vertical_rate) + '">' +
+                (r.vertical_rate != null ? (r.vertical_rate > 0 ? '+' : '') + fmt(r.vertical_rate, 1) : '—') + '</td>' +
+              '<td style="padding:6px 10px;text-align:right;color:#e6edf3">' +
+                (msToKt(r.velocity) != null ? msToKt(r.velocity) : '—') + '</td>' +
+              '<td style="padding:6px 10px;text-align:right;color:#8b949e">' + fmt(r.true_track) + '</td>' +
+              '<td style="padding:6px 10px;text-align:center">' + statusBadge(r) + '</td>' +
+              '<td style="padding:6px 10px;color:#8b949e">' + (r.squawk || '—') + '</td>' +
+              '<td style="padding:6px 10px;color:#57606a;font-size:11px;white-space:nowrap">' + (r._received_at || '—') + '</td>' +
+              '</tr>';
+          }).join('');
+        }
+        /* Start raw polling when Flight Events tab is clicked */
+        document.addEventListener('DOMContentLoaded', function() {
+          document.getElementById('tab-btn-events').addEventListener('click', function() {
+            if (!_rawPollTimer) {
+              pollRaw();
+              _rawPollTimer = setInterval(pollRaw, 3000);
+            }
+          });
+        });
+
+        var _pollTimer = null;
+        var _fastPollTimer = null;
+        function startPoll() {
+          if (_pollTimer) return;
+          poll();
+          _pollTimer = setInterval(poll, 3000);
+        }
+        function stopPoll() {
+          if (_pollTimer)     { clearInterval(_pollTimer);     _pollTimer     = null; }
+          if (_fastPollTimer) { clearInterval(_fastPollTimer); _fastPollTimer = null; }
+        }
+        function stopRawPoll() {
+          if (_rawPollTimer) { clearInterval(_rawPollTimer); _rawPollTimer = null; }
+        }
+        /* Switch to 1 s polling for `durationMs` ms, then revert to 3 s. */
+        function burstPoll(durationMs) {
+          stopPoll();
+          if (_fastPollTimer) { clearInterval(_fastPollTimer); _fastPollTimer = null; }
+          poll();
+          _fastPollTimer = setInterval(poll, 1000);
+          setTimeout(function() {
+            if (_fastPollTimer) { clearInterval(_fastPollTimer); _fastPollTimer = null; }
+            stopPoll();
+            startPoll();
+          }, durationMs);
+        }
+        function poll() {
+          fetch('/api/alerts')
+            .then(function(r){ return r.json(); })
+            .then(function(data){
+              _alertsData = data;
+              /* Compute max id before render so card-new class is correct */
+              var maxId = 0;
+              data.forEach(function(a){ if ((a._id||0) > maxId) maxId = a._id; });
+              renderCards(data);
+              /* Advance seen-id after render so next poll knows what was new */
+              _lastSeenId = maxId;
+              var now = new Date();
+              document.getElementById('hdr-clock').textContent =
+                now.toISOString().slice(11, 19) + ' UTC';
+            })
+            .catch(function(){ /* ignore transient network errors */ });
+        }
+
+        /* ── Flink health poll (every 15 s) ── */
+        function pollHealth() {
+          fetch('/api/health')
+            .then(function(r){ return r.json(); })
+            .then(function(d) {
+              var dot  = document.getElementById('flink-dot');
+              var txt  = document.getElementById('flink-status-text');
+              if (!dot || !txt) return;
+              if (d.flink_status === 'RUNNING') {
+                dot.className = 'hdr-dot';
+                dot.title = 'Flink: RUNNING — ' + (d.job_name || d.job_id || '');
+                txt.textContent = 'RUNNING';
+                txt.style.color = '#3fb950';
+              } else if (d.flink_status === 'NO_JOB') {
+                dot.className = 'hdr-dot error';
+                dot.title = 'Flink: no job running — resubmit SQL';
+                txt.textContent = 'NO JOB ⚠';
+                txt.style.color = '#f85149';
+              } else {
+                dot.className = 'hdr-dot warn';
+                dot.title = 'Flink: ' + d.flink_status + (d.detail ? ' — ' + d.detail : '');
+                txt.textContent = d.flink_status;
+                txt.style.color = '#d29922';
+              }
+            })
+            .catch(function() {
+              var dot = document.getElementById('flink-dot');
+              if (dot) { dot.className = 'hdr-dot warn'; dot.title = 'Flink: unreachable'; }
+            });
+        }
+        pollHealth();
+        setInterval(pollHealth, 15000);
+
+        /* ── Drawer open/close ── */
+        function openDrawer(id) {
+          var a = null;
+          for (var i = 0; i < _alertsData.length; i++) {
+            if (_alertsData[i]._id === id) { a = _alertsData[i]; break; }
+          }
+          if (!a) return;
+          var _DRAWER_TITLES = {
+            'ory_missed_approach':  '🔴 Missed Approach — Details',
+            'ory_twin_landing':     '🟡 Twin Landing — Details',
+            'ory_repeated_goaround':'🔁 Repeat Go-Around — Details',
+            'ory_rapid_descent':    '🔻 Rapid Descent — Details',
+            'ory_corridor_overload':'🔵 Corridor Overload — Details',
+          };
+          document.getElementById('drawerTitle').textContent =
+            _DRAWER_TITLES[a._topic] || '📋 Alert Details';
+          document.getElementById('drawerBody').innerHTML = buildDrawerHTML(a);
+          document.getElementById('drawer').classList.add('open');
+          document.getElementById('drawerOverlay').classList.add('open');
+        }
+
+        function closeDrawer() {
+          document.getElementById('drawer').classList.remove('open');
+          document.getElementById('drawerOverlay').classList.remove('open');
+        }
+
+        document.addEventListener('keydown', function(e){
+          if (e.key === 'Escape') closeDrawer();
+        });
+
+        /* ── Wire up all event listeners on DOMContentLoaded ── */
+        document.addEventListener('DOMContentLoaded', function() {
+          document.getElementById('tab-btn-sim').addEventListener('click',    function(){ showTab('sim'); });
+          document.getElementById('tab-btn-live').addEventListener('click',   function(){ showTab('live'); });
+          document.getElementById('tab-btn-events').addEventListener('click', function(){ showTab('events'); });
+          document.getElementById('tab-btn-about').addEventListener('click',  function(){ showTab('about'); });
+          document.getElementById('drawerOverlay').addEventListener('click', closeDrawer);
+
+          /* Start polling immediately */
+          startPoll();
+
+          /* ── Sim control buttons ── */
+          function simControl(action) {
+            var status = document.getElementById('sim-status');
+            var btns   = [
+              document.getElementById('sim-btn-start'),
+              document.getElementById('sim-btn-stop'),
+              document.getElementById('sim-btn-reset'),
+            ];
+            var labels = { start: 'Starting…', stop: 'Stopping…', reset: 'Resetting…' };
+            var ok     = { start: 'Started ✓', stop: 'Stopped ✓', reset: 'Cleared ✓' };
+
+            btns.forEach(function(b){ b.disabled = true; });
+            status.textContent = labels[action] || '';
+            status.style.color = '#8b949e';
+
+            fetch('/sim/' + action, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: '{}',
+            })
+              .then(function(r){ return r.json().then(function(body){ return { ok: r.ok, body: body }; }); })
+              .then(function(res){
+                if (!res.ok) {
+                  status.style.color = '#f85149';
+                  status.textContent = res.body.message || 'Error';
+                } else {
+                  status.style.color = '#3fb950';
+                  status.textContent = ok[action] || 'Done';
+                  if (action === 'reset') {
+                    /* Clear alerts panels and Flight Events table immediately.
+                       Cancel the raw poll timer so it cannot overwrite the cleared
+                       state before the backend seek has settled, then restart it
+                       after a short gap so the next fetch reflects empty data. */
+                    _alertsData = [];
+                    renderCards([]);
+                    renderRaw([]);
+                    if (_rawPollTimer) {
+                      clearInterval(_rawPollTimer);
+                      _rawPollTimer = null;
+                      setTimeout(function() {
+                        pollRaw();
+                        _rawPollTimer = setInterval(pollRaw, 3000);
+                      }, 2000);
+                    }
+                    status.textContent = 'Cleared ✓ — waiting for new alerts…';
+                    setTimeout(function(){
+                      status.textContent = '';
+                      status.style.color = '#8b949e';
+                    }, 4000);
+                  } else if (action === 'start') {
+                    /* Restart both poll timers in case Stop had frozen them. */
+                    stopPoll();
+                    stopRawPoll();
+                    /* Poll at 1 s for 45 s: covers pod startup (~5 s) + first MA scenario
+                       (~9 s) + Flink watermark (15 s) + margin — first alert within ~30 s. */
+                    burstPoll(45000);
+                    if (!_rawPollTimer) {
+                      pollRaw();
+                      _rawPollTimer = setInterval(pollRaw, 3000);
+                    }
+                    /* Show 'Started ✓' for 3 s, then switch to persistent 'Starting…' */
+                    setTimeout(function(){
+                      status.style.color = '#8b949e';
+                      status.textContent = 'Starting…';
+                    }, 3000);
+                  } else if (action === 'stop') {
+                    /* Freeze the UI: stop polling alerts and raw feed so no new
+                       cards appear while the simulator is stopped. */
+                    stopPoll();
+                    stopRawPoll();
+                    setTimeout(function(){
+                      status.textContent = '';
+                      status.style.color = '#8b949e';
+                    }, 3000);
+                  }
+                }
+                btns.forEach(function(b){ b.disabled = false; });
+              })
+              .catch(function(err){
+                status.style.color = '#f85149';
+                status.textContent = 'Network error';
+                btns.forEach(function(b){ b.disabled = false; });
+              });
+          }
+          document.getElementById('sim-btn-start').addEventListener('click', function(){ simControl('start'); });
+          document.getElementById('sim-btn-stop').addEventListener('click',  function(){ simControl('stop');  });
+          document.getElementById('sim-btn-reset').addEventListener('click', function(){ simControl('reset'); });
+        });
+
+        /* ── Drawer content builder ── */
+        function fmt(v) { return v != null ? Math.round(v) : '—'; }
+        function fmtFt(m) { return m != null ? Math.round(m * 3.281) + ' ft' : '—'; }
+
+        function buildDrawerHTML(a) {
+          if (a._topic === 'ory_missed_approach')  return buildMA(a);
+          if (a._topic === 'ory_twin_landing')     return buildTW(a);
+          if (a._topic === 'ory_repeated_goaround')return buildRGA(a);
+          if (a._topic === 'ory_rapid_descent')    return buildRD(a);
+          if (a._topic === 'ory_corridor_overload')return buildCO(a);
+          return '<p>Unknown alert type.</p>';
+        }
+
+        /* ─── Missed Approach drawer ─── */
+        function buildMA(a) {
+          var cs     = a.callsign || a.icao24 || '—';
+          var alt0   = a.approach_alt  || 0;
+          var altGA  = a.go_around_alt || 0;
+          // alt0 = entry altitude (A anchor, ~600–900 m), altGA = altitude at last C event.
+          // Aircraft descends through alt0 then climbs; recovery = altitude regained above entry.
+          var recovery = Math.max(0, altGA - alt0);
+          var simTag = a._simulated
+            ? '<span style="background:#1e1433;color:#bc8cff;border:1px solid #6e40c9;border-radius:4px;padding:1px 7px;font-size:10px;font-weight:700;">SIMULATED</span> '
+            : '<span style="background:#0d2a0d;color:#3fb950;border:1px solid #2a5a2a;border-radius:4px;padding:1px 7px;font-size:10px;font-weight:700;">LIVE</span> ';
+
+          // Severity based on go-around altitude (altGA = last C event = recovery point).
+          // Lower altGA means aircraft came closer to ground before climbing out.
+          var sevLabel = altGA < 300 ? 'Critical' : altGA < 600 ? 'High' : 'Medium';
+          var sevColor = altGA < 300 ? 'red'      : altGA < 600 ? 'yellow' : 'green';
+          var sevPct   = Math.max(5, Math.min(95, 100 - (altGA / 914) * 100));
+
+          // mini altitude profile SVG (approach descent + go-around climb)
+          var svgH = 110, svgW = 420;
+          // normalise altitudes to SVG height
+          var maxAlt = 1000;
+          var yOf = function(alt){ return svgH - 10 - (Math.min(alt, maxAlt) / maxAlt) * (svgH - 20); };
+          // approach segment: cruise → alt0
+          var pts = [
+            [20,   yOf(900)],
+            [80,   yOf(850)],
+            [150,  yOf(alt0)],
+            [220,  yOf(Math.max(altGA - 80, alt0 * 0.7))],
+            [300,  yOf(altGA)],
+            [380,  yOf(altGA + 200)],
+          ];
+          var path = pts.map(function(p,i){ return (i===0?'M':'L')+p[0]+','+p[1]; }).join(' ');
+
+          return '' +
+            '<h3>Aircraft</h3>' +
+            '<p>' + simTag + '<strong style="color:#e6edf3;font-size:15px;">' + cs + '</strong>' +
+            (!a._simulated && a.icao24 ? ' <span style="color:#8b949e;font-size:11px;">· ' + a.icao24 + '</span>' : '') + '</p>' +
+            (a.airline ? '<p style="color:#8b949e;font-size:12px;">Airline: ' + a.airline + (a.route ? ' · Route: ' + a.route : '') + '</p>' : '') +
+
+            '<h3>What Happened</h3>' +
+            '<p>The aircraft entered the ORY final approach corridor descending through ' +
+            '<strong>' + fmt(alt0) + ' m (' + fmtFt(alt0) + ')</strong> with a negative vertical rate, ' +
+            'indicating it was established on finals. Instead of completing the landing, ' +
+            'it executed a <strong>go-around manoeuvre</strong> — climbing back out to ' +
+            '<strong>' + fmt(altGA) + ' m (' + fmtFt(altGA) + ')</strong>. ' +
+            'Flink detected the pattern <code>APPROACH → LEVEL* → CLIMBING</code> within the 10-minute CEP window.</p>' +
+
+            '<p>Go-arounds are normal procedure when runway conditions are unsafe or ATC instructs a missed approach. ' +
+            'This CEP alert flags the event for review — repeated go-arounds on the same aircraft in a short period may indicate a technical issue.</p>' +
+
+            '<h3>Key Measurements</h3>' +
+            '<div class="fact-grid">' +
+            '  <div class="fact"><div class="label">Approach altitude</div><div class="value red">' + fmt(alt0) + ' m</div></div>' +
+            '  <div class="fact"><div class="label">Go-around altitude</div><div class="value green">' + fmt(altGA) + ' m</div></div>' +
+            '  <div class="fact"><div class="label">Recovery gained</div><div class="value yellow">' + fmt(recovery) + ' m</div></div>' +
+            '  <div class="fact"><div class="label">Severity</div><div class="value ' + sevColor + '">' + sevLabel + '</div></div>' +
+            '</div>' +
+
+            '<h3>Severity Indicator</h3>' +
+            '<div class="severity-bar"></div>' +
+            '<div class="severity-label"><span>Low risk</span><span>◆ go-around at ' + fmt(altGA) + ' m</span><span>Critical</span></div>' +
+
+            '<h3>Flight Profile</h3>' +
+            '<div class="drawer-svg"><svg width="' + svgW + '" height="' + svgH + '" viewBox="0 0 ' + svgW + ' ' + svgH + '" font-family="Segoe UI,sans-serif" font-size="10">' +
+            '  <line x1="20" y1="' + svgH + '" x2="' + svgW + '" y2="' + svgH + '" stroke="#21262d" stroke-width="1"/>' +
+            '  <line x1="20" y1="' + yOf(914) + '" x2="' + svgW + '" y2="' + yOf(914) + '" stroke="#f85149" stroke-width="1" stroke-dasharray="4,3"/>' +
+            '  <text x="22" y="' + (yOf(914) - 3) + '" fill="#f85149" font-size="9">3 000 ft corridor threshold</text>' +
+            '  <polyline points="' + pts.map(function(p){return p[0]+','+p[1];}).join(' ') + '" fill="none" stroke="#58a6ff" stroke-width="2.5" stroke-linejoin="round"/>' +
+            '  <circle cx="' + pts[2][0] + '" cy="' + pts[2][1] + '" r="5" fill="#f85149"/>' +
+            '  <text x="' + (pts[2][0]+7) + '" y="' + (pts[2][1]+4) + '" fill="#f85149">approach ' + fmt(alt0) + 'm</text>' +
+            '  <circle cx="' + pts[4][0] + '" cy="' + pts[4][1] + '" r="5" fill="#3fb950"/>' +
+            '  <text x="' + (pts[4][0]+7) + '" y="' + (pts[4][1]+4) + '" fill="#3fb950">go-around ' + fmt(altGA) + 'm</text>' +
+            '  <text x="' + (svgW/2) + '" y="' + (svgH - 2) + '" fill="#8b949e" text-anchor="middle">time →</text>' +
+            '</svg></div>' +
+
+            '<h3>Detection</h3>' +
+            '<p>Detected at <strong>' + (a._received_at || '—') + '</strong> via Flink <code>MATCH_RECOGNIZE</code> pattern running on the <code>ory_approach_events</code> view.<br>' +
+            'Alert published to Kafka topic <code>ory_missed_approach</code> and consumed by this dashboard.</p>' +
+            (a.approach_ts ? '<p style="color:#8b949e;font-size:11px;">approach_ts: ' + a.approach_ts + (a.go_around_ts ? ' · go_around_ts: ' + a.go_around_ts : '') + '</p>' : '');
+        }
+
+        /* ─── Twin Landing drawer ─── */
+        function buildTW(a) {
+          var csA = a.callsign_a || a.icao24_a || '—';
+          var csB = a.callsign_b || a.icao24_b || '—';
+          var altA = a.alt_a || 0;
+          var altB = a.alt_b || 0;
+          var diff = Math.abs(altA - altB);
+          var simTag = a._simulated
+            ? '<span style="background:#1e1433;color:#bc8cff;border:1px solid #6e40c9;border-radius:4px;padding:1px 7px;font-size:10px;font-weight:700;">SIMULATED</span>'
+            : '<span style="background:#0d2a0d;color:#3fb950;border:1px solid #2a5a2a;border-radius:4px;padding:1px 7px;font-size:10px;font-weight:700;">LIVE</span>';
+
+          var svgW = 420, svgH = 120;
+          var maxAlt = 500;
+          var barH = function(alt){ return Math.max(4, (Math.min(alt, maxAlt) / maxAlt) * 80); };
+          var y0 = svgH - 20;
+          var bHA = barH(altA), bHB = barH(altB);
+
+          return '' +
+            '<h3>Source ' + simTag + '</h3>' +
+
+            '<h3>Aircraft Involved</h3>' +
+            '<div class="fact-grid">' +
+              '  <div class="fact" style="border-color:#58a6ff">' +
+              '    <div class="label">Aircraft A</div>' +
+              '    <div class="value" style="color:#58a6ff;font-size:13px;">' + csA + '</div>' +
+              '    <div style="color:#8b949e;font-size:11px;margin-top:3px;">' + (!a._simulated ? (a.icao24_a||'') : '') + '</div>' +
+              '  </div>' +
+              '  <div class="fact" style="border-color:#bc8cff">' +
+              '    <div class="label">Aircraft B</div>' +
+              '    <div class="value" style="color:#bc8cff;font-size:13px;">' + csB + '</div>' +
+              '    <div style="color:#8b949e;font-size:11px;margin-top:3px;">' + (!a._simulated ? (a.icao24_b||'') : '') + '</div>' +
+              '  </div>' +
+              '</div>' +
+
+            '<h3>What Happened</h3>' +
+            '<p>Two aircraft were simultaneously inside the ORY short-final zone (below 1 640 ft / 500 m, not on ground) ' +
+            'on the <strong>same runway axis</strong> within the same <strong>90-second HOP window</strong>. ' +
+            '<strong>' + csA + '</strong> averaged <strong>' + fmt(altA) + ' m</strong> and ' +
+            '<strong>' + csB + '</strong> averaged <strong>' + fmt(altB) + ' m</strong> — ' +
+            'a vertical separation of only <strong>' + fmt(diff) + ' m (' + fmtFt(diff) + ')</strong>.</p>' +
+
+            '<p>Paris-Orly operates two pairs of parallel runways (06L/06R and 24L/24R). Dependent Parallel Approaches require ≥ 2 NM (≈ 80 s) longitudinal separation between consecutive aircraft on the same approach axis (ICAO Doc 4444 §6.7). ' +
+            'Two aircraft simultaneously inside the 500 m short-final zone violates this minimum. ' +
+            'Flink detected this via a <code>HOP(90 s, 10 s)</code> self-join on the <code>ory_short_final</code> view.</p>' +
+
+            '<h3>Altitude Comparison</h3>' +
+            '<div class="fact-grid">' +
+            '  <div class="fact"><div class="label">' + csA + ' avg alt</div><div class="value yellow">' + fmt(altA) + ' m</div></div>' +
+            '  <div class="fact"><div class="label">' + csB + ' avg alt</div><div class="value yellow">' + fmt(altB) + ' m</div></div>' +
+            '  <div class="fact"><div class="label">Vertical separation</div><div class="value ' + (diff < 100 ? 'red' : 'yellow') + '">' + fmt(diff) + ' m</div></div>' +
+            '  <div class="fact"><div class="label">Window</div><div class="value" style="font-size:11px;">' + (a.window_start ? a.window_start.slice(11,16) + ' → ' + a.window_end.slice(11,16) : '90 s HOP') + '</div></div>' +
+            '</div>' +
+
+            '<h3>Approach Profile</h3>' +
+            '<div class="drawer-svg"><svg width="' + svgW + '" height="' + svgH + '" viewBox="0 0 ' + svgW + ' ' + svgH + '" font-family="Segoe UI,sans-serif" font-size="10">' +
+            '  <line x1="40" y1="' + (y0 - 80) + '" x2="40" y2="' + y0 + '" stroke="#21262d" stroke-width="1"/>' +
+            '  <line x1="40" y1="' + y0 + '" x2="' + (svgW - 20) + '" y2="' + y0 + '" stroke="#21262d" stroke-width="1"/>' +
+            '  <text x="38" y="' + (y0 - 80) + '" fill="#8b949e" text-anchor="end">500 m</text>' +
+            '  <text x="38" y="' + y0 + '" fill="#8b949e" text-anchor="end">0 m</text>' +
+            // Bar A
+            '  <rect x="120" y="' + (y0 - bHA) + '" width="60" height="' + bHA + '" fill="#1a2233" stroke="#58a6ff" stroke-width="1.5" rx="3"/>' +
+            '  <text x="150" y="' + (y0 - bHA - 5) + '" fill="#58a6ff" text-anchor="middle">' + fmt(altA) + ' m</text>' +
+            '  <text x="150" y="' + (y0 + 12) + '" fill="#58a6ff" text-anchor="middle">' + csA + '</text>' +
+            // Bar B
+            '  <rect x="240" y="' + (y0 - bHB) + '" width="60" height="' + bHB + '" fill="#1e1433" stroke="#bc8cff" stroke-width="1.5" rx="3"/>' +
+            '  <text x="270" y="' + (y0 - bHB - 5) + '" fill="#bc8cff" text-anchor="middle">' + fmt(altB) + ' m</text>' +
+            '  <text x="270" y="' + (y0 + 12) + '" fill="#bc8cff" text-anchor="middle">' + csB + '</text>' +
+            // Corridor line
+            '  <line x1="40" y1="' + (y0 - 80) + '" x2="' + (svgW-20) + '" y2="' + (y0-80) + '" stroke="#d29922" stroke-width="1" stroke-dasharray="4,3"/>' +
+            '  <text x="' + (svgW-22) + '" y="' + (y0 - 83) + '" fill="#d29922" text-anchor="end" font-size="9">short-final ceiling (500 m)</text>' +
+            '</svg></div>' +
+
+            '<h3>Detection</h3>' +
+            '<p>Detected at <strong>' + (a._received_at || '—') + '</strong> via Flink <code>HOP(90 s, 10 s)</code> window self-join on <code>ory_short_final</code>.<br>' +
+            'Alert published to Kafka topic <code>ory_twin_landing</code>.</p>' +
+            (a.window_start ? '<p style="color:#8b949e;font-size:11px;">Window: ' + a.window_start + ' → ' + a.window_end + '</p>' : '');
+        }
+
+        /* ─── Repeat Go-Around drawer ─── */
+        function buildRGA(a) {
+          var cs = a.callsign || a.icao24 || '—';
+          var simTag = a._simulated
+            ? '<span style="background:#1e1433;color:#bc8cff;border:1px solid #6e40c9;border-radius:4px;padding:1px 7px;font-size:10px;font-weight:700;">SIMULATED</span> '
+            : '<span style="background:#0d2a0d;color:#3fb950;border:1px solid #2a5a2a;border-radius:4px;padding:1px 7px;font-size:10px;font-weight:700;">LIVE</span> ';
+
+          var t1 = a.goaround_1 ? a.goaround_1.slice(11, 19) : '—';
+          var t2 = a.goaround_2 ? a.goaround_2.slice(11, 19) : '—';
+          // Minutes between the two go-arounds
+          var gapMin = '—';
+          if (a.goaround_1 && a.goaround_2) {
+            // Flink TIMESTAMP(3) fields arrive as "2025-01-15 14:23:01.000" (space separator).
+            // Replace space with T so Safari (strict ISO 8601) parses them correctly.
+            var d1 = new Date(a.goaround_1.replace(' ', 'T'));
+            var d2 = new Date(a.goaround_2.replace(' ', 'T'));
+            var ms = d2.getTime() - d1.getTime();
+            if (!isNaN(ms)) gapMin = Math.round(ms / 60000);
+          }
+
+          // SVG: two go-around bumps on a timeline
+          var svgW = 420, svgH = 110;
+          var yBase = svgH - 15;
+          var bump = function(cx, label, col) {
+            var p = 'M' + (cx-60) + ',' + yBase + ' Q' + (cx-30) + ',' + (yBase-55) + ' ' + cx + ',' + (yBase-70) +
+                    ' Q' + (cx+30) + ',' + (yBase-55) + ' ' + (cx+60) + ',' + yBase;
+            return '<path d="' + p + '" fill="none" stroke="' + col + '" stroke-width="2.5"/>' +
+                   '<circle cx="' + cx + '" cy="' + (yBase-70) + '" r="4" fill="' + col + '"/>' +
+                   '<text x="' + cx + '" y="' + (yBase-76) + '" fill="' + col + '" text-anchor="middle" font-size="9">' + label + '</text>';
+          };
+
+          return '' +
+            '<h3>Aircraft ' + simTag + '</h3>' +
+            '<p><strong style="color:#e6edf3;font-size:15px;">' + cs + '</strong>' +
+            (!a._simulated && a.icao24 ? ' <span style="color:#8b949e;font-size:11px;">· ' + a.icao24 + '</span>' : '') + '</p>' +
+
+            '<h3>What Happened</h3>' +
+            '<p>The same aircraft executed <strong>two missed approaches</strong> within a <strong>30-minute window</strong>. ' +
+            'A single go-around is a routine safety manoeuvre, but a <em>repeat</em> go-around by the same aircraft suggests a persistent problem: ' +
+            'an unstabilised approach, a technical fault, or a recurring runway obstruction.</p>' +
+            '<p>Flink detected this by joining the <code>ory_missed_approach</code> stream with itself — matching two alerts on the same <code>icao24</code> ' +
+            'within a 30-minute interval.</p>' +
+
+            '<h3>Timeline</h3>' +
+            '<div class="fact-grid">' +
+            '  <div class="fact"><div class="label">1st go-around</div><div class="value yellow">' + t1 + '</div></div>' +
+            '  <div class="fact"><div class="label">2nd go-around</div><div class="value red">' + t2 + '</div></div>' +
+            '  <div class="fact"><div class="label">Interval</div><div class="value ' + (typeof gapMin === 'number' && gapMin < 10 ? 'red' : 'yellow') + '">' + gapMin + ' min</div></div>' +
+            '  <div class="fact"><div class="label">CEP window</div><div class="value" style="font-size:11px;">30 min</div></div>' +
+            '</div>' +
+
+            '<h3>Flight Profile</h3>' +
+            '<div class="drawer-svg"><svg width="' + svgW + '" height="' + svgH + '" viewBox="0 0 ' + svgW + ' ' + svgH + '" font-family="Segoe UI,sans-serif" font-size="10">' +
+            '  <line x1="20" y1="' + yBase + '" x2="' + (svgW-20) + '" y2="' + yBase + '" stroke="#21262d" stroke-width="1"/>' +
+            bump(130, '1st go-around', '#d29922') +
+            bump(290, '2nd go-around', '#f85149') +
+            '  <text x="' + (svgW/2) + '" y="' + (svgH-3) + '" fill="#8b949e" text-anchor="middle">time →</text>' +
+            '</svg></div>' +
+
+            '<h3>Detection</h3>' +
+            '<p>Detected at <strong>' + (a._received_at || '—') + '</strong> via Flink interval join on topic <code>ory_missed_approach</code>.<br>' +
+            'Alert published to Kafka topic <code>ory_repeated_goaround</code>.</p>';
+        }
+
+        /* ─── Rapid Descent drawer ─── */
+        function buildRD(a) {
+          var cs = a.callsign || a.icao24 || '—';
+          var alt   = a.baro_altitude  != null ? a.baro_altitude  : null;
+          var vrate = a.vertical_rate  != null ? a.vertical_rate  : null;
+          var simTag = a._simulated
+            ? '<span style="background:#1e1433;color:#bc8cff;border:1px solid #6e40c9;border-radius:4px;padding:1px 7px;font-size:10px;font-weight:700;">SIMULATED</span> '
+            : '<span style="background:#0d2a0d;color:#3fb950;border:1px solid #2a5a2a;border-radius:4px;padding:1px 7px;font-size:10px;font-weight:700;">LIVE</span> ';
+
+          // Severity: vrate < -25 = Critical, < -20 = High, ≤ -18 = Medium (minimum trigger threshold)
+          var vr = vrate != null ? vrate : -18;
+          var sevLabel = vr < -25 ? 'Critical' : vr < -20 ? 'High' : 'Medium';
+          var sevColor = vr < -25 ? 'red'      : vr < -20 ? 'yellow' : 'green';
+
+          // SVG: steep nose-down arrow
+          var svgW = 420, svgH = 110;
+          var cx = svgW / 2;
+          var altPct = alt != null ? Math.min(1, alt / 2000) : 0.5;
+          var yAlt = 15 + (1 - altPct) * 70;
+          var yLow = yAlt + 55;
+
+          return '' +
+            '<h3>Aircraft ' + simTag + '</h3>' +
+            '<p><strong style="color:#e6edf3;font-size:15px;">' + cs + '</strong>' +
+            (!a._simulated && a.icao24 ? ' <span style="color:#8b949e;font-size:11px;">· ' + a.icao24 + '</span>' : '') + '</p>' +
+
+            '<h3>What Happened</h3>' +
+            '<p>An aircraft below <strong>2 000 m</strong> was detected descending at more than <strong>−18 m/s (−3 540 ft/min)</strong>. ' +
+            'A descent rate of this magnitude near the ground, without a declared approach, is a potential emergency condition — ' +
+            'it may indicate a loss of control, engine failure, or uncontrolled dive.</p>' +
+            '<p>Flink detected this by filtering <code>adsb_raw</code> for <code>baro_altitude &lt; 2000</code> AND <code>vertical_rate &lt; −18</code>.</p>' +
+
+            '<h3>Key Measurements</h3>' +
+            '<div class="fact-grid">' +
+            '  <div class="fact"><div class="label">Altitude</div><div class="value yellow">' + fmt(alt) + ' m (' + fmtFt(alt) + ')</div></div>' +
+            '  <div class="fact"><div class="label">Vertical rate</div><div class="value red">' + fmt(vrate) + ' m/s</div></div>' +
+            '  <div class="fact"><div class="label">Severity</div><div class="value ' + sevColor + '">' + sevLabel + '</div></div>' +
+            '  <div class="fact"><div class="label">Threshold</div><div class="value" style="font-size:11px;">&lt; −18 m/s below 2 000 m</div></div>' +
+            '</div>' +
+
+            '<h3>Flight Profile</h3>' +
+            '<div class="drawer-svg"><svg width="' + svgW + '" height="' + svgH + '" viewBox="0 0 ' + svgW + ' ' + svgH + '" font-family="Segoe UI,sans-serif" font-size="10">' +
+            '  <line x1="20" y1="' + (svgH-10) + '" x2="' + (svgW-20) + '" y2="' + (svgH-10) + '" stroke="#21262d" stroke-width="1"/>' +
+            '  <line x1="20" y1="' + 15 + '" x2="20" y2="' + (svgH-10) + '" stroke="#21262d" stroke-width="1"/>' +
+            '  <line x1="20" y1="30" x2="' + (svgW-20) + '" y2="30" stroke="#d29922" stroke-width="1" stroke-dasharray="4,3"/>' +
+            '  <text x="22" y="27" fill="#d29922" font-size="9">2 000 m ceiling</text>' +
+            '  <polyline points="' + (cx-80) + ',' + yAlt + ' ' + cx + ',' + yLow + '" fill="none" stroke="#f85149" stroke-width="3" stroke-linejoin="round"/>' +
+            '  <polygon points="' + cx + ',' + (yLow+8) + ' ' + (cx-7) + ',' + (yLow-4) + ' ' + (cx+7) + ',' + (yLow-4) + '" fill="#f85149"/>' +
+            '  <circle cx="' + (cx-80) + '" cy="' + yAlt + '" r="5" fill="#58a6ff"/>' +
+            '  <text x="' + (cx-72) + '" y="' + (yAlt-5) + '" fill="#58a6ff" font-size="9">' + fmt(alt) + 'm</text>' +
+            '  <text x="' + (cx+6) + '" y="' + (yLow+4) + '" fill="#f85149" font-size="9">' + fmt(vrate) + 'm/s</text>' +
+            '  <text x="' + (svgW/2) + '" y="' + (svgH-1) + '" fill="#8b949e" text-anchor="middle">time →</text>' +
+            '</svg></div>' +
+
+            '<h3>Detection</h3>' +
+            '<p>Detected at <strong>' + (a._received_at || '—') + '</strong> via Flink streaming filter on <code>adsb_raw</code>.<br>' +
+            'Alert published to Kafka topic <code>ory_rapid_descent</code>.</p>' +
+            (a.detection_ts ? '<p style="color:#8b949e;font-size:11px;">detection_ts: ' + a.detection_ts + '</p>' : '');
+        }
+
+        /* ─── Corridor Overload drawer ─── */
+        function buildCO(a) {
+          var count = a.aircraft_count != null ? a.aircraft_count : '—';
+          var simTag = a._simulated
+            ? '<span style="background:#1e1433;color:#bc8cff;border:1px solid #6e40c9;border-radius:4px;padding:1px 7px;font-size:10px;font-weight:700;">SIMULATED</span>'
+            : '<span style="background:#0d2a0d;color:#3fb950;border:1px solid #2a5a2a;border-radius:4px;padding:1px 7px;font-size:10px;font-weight:700;">LIVE</span>';
+          var winStart = a.window_start ? a.window_start.slice(11, 16) : '—';
+          var winEnd   = a.window_end   ? a.window_end.slice(11, 16)   : '—';
+
+          // Severity: ≥ 5 = Critical, ≥ 4 = High, ≥ 3 = Medium
+          var n = typeof count === 'number' ? count : parseInt(count, 10);
+          var sevLabel = n >= 5 ? 'Critical' : n >= 4 ? 'High' : 'Medium';
+          var sevColor = n >= 5 ? 'red'      : n >= 4 ? 'yellow' : 'green';
+
+          // SVG: funnel with N aircraft symbols descending
+          var svgW = 420, svgH = 110;
+          var nDraw = Math.min(typeof n === 'number' && !isNaN(n) ? n : 3, 7);
+          var planeIcons = '';
+          var spacing = Math.min(60, (svgW - 80) / Math.max(nDraw, 1));
+          for (var pi = 0; pi < nDraw; pi++) {
+            var px = 60 + pi * spacing;
+            var py = 20 + (pi % 2) * 12;
+            planeIcons += '<text x="' + px + '" y="' + py + '" font-size="18" text-anchor="middle" fill="#58a6ff">✈</text>';
+          }
+
+          return '' +
+            '<h3>Source ' + simTag + '</h3>' +
+
+            '<h3>What Happened</h3>' +
+            '<p><strong>' + count + ' distinct aircraft</strong> were simultaneously inside the ORY approach corridor (below 3 000 ft / 914 m, ' +
+            'not on ground) within the same <strong>30-second tumbling window</strong> (' + winStart + ' → ' + winEnd + ').</p>' +
+            '<p>Paris-Orly has two independent runways, so at most 2 aircraft should be on simultaneous finals under normal conditions. ' +
+            'Three or more is an abnormal traffic density that may indicate an ATC overload or a sequencing breakdown. ' +
+            'Flink detected this via <code>COUNT(DISTINCT icao24) ≥ 3</code> in a <code>TUMBLE(30 s)</code> window.</p>' +
+
+            '<h3>Traffic Summary</h3>' +
+            '<div class="fact-grid">' +
+            '  <div class="fact"><div class="label">Aircraft in corridor</div><div class="value red">' + count + '</div></div>' +
+            '  <div class="fact"><div class="label">Severity</div><div class="value ' + sevColor + '">' + sevLabel + '</div></div>' +
+            '  <div class="fact"><div class="label">Window start</div><div class="value" style="font-size:11px;">' + winStart + '</div></div>' +
+            '  <div class="fact"><div class="label">Window end</div><div class="value" style="font-size:11px;">' + winEnd + '</div></div>' +
+            '</div>' +
+
+            '<h3>Approach Traffic</h3>' +
+            '<div class="drawer-svg"><svg width="' + svgW + '" height="' + svgH + '" viewBox="0 0 ' + svgW + ' ' + svgH + '" font-family="Segoe UI,sans-serif" font-size="10">' +
+            planeIcons +
+            '  <path d="M40,40 L' + (svgW/2) + ',95 L' + (svgW-40) + ',40" fill="none" stroke="#21262d" stroke-width="1" stroke-dasharray="3,3"/>' +
+            '  <text x="' + (svgW/2) + '" y="' + (svgH-1) + '" fill="#8b949e" text-anchor="middle">ORY approach corridor (30-s window)</text>' +
+            '</svg></div>' +
+
+            '<h3>Detection</h3>' +
+            '<p>Detected at <strong>' + (a._received_at || '—') + '</strong> via Flink <code>TUMBLE(30 s)</code> aggregate on <code>ory_approach_cep4</code>.<br>' +
+            'Alert published to Kafka topic <code>ory_corridor_overload</code>.</p>' +
+            (a.window_start ? '<p style="color:#8b949e;font-size:11px;">Window: ' + a.window_start + ' → ' + a.window_end + '</p>' : '');
+        }
+      </script>
+    </body>
+    </html><!--HTML_END-->"""
+
+    _HTML_MARKER_START = '<!--HTML_START-->'
+    _HTML_MARKER_END   = '<!--HTML_END-->'
+
+    @app.route("/")
+    def index():
+        # Re-read /scripts/app.py on every request — picks up ConfigMap
+        # volume updates without a pod restart.
+        try:
+            src = open('/scripts/app.py', encoding='utf-8').read()
+            s = src.index(_HTML_MARKER_START) + len(_HTML_MARKER_START)
+            e = src.index(_HTML_MARKER_END)
+            from flask import Response
+            return Response(src[s:e], mimetype='text/html',
+                headers={'Cache-Control': 'no-store'})
+        except Exception:
+            from flask import Response
+            return Response(render_template_string(_HTML), mimetype='text/html',
+                headers={'Cache-Control': 'no-store'})
+
+    if __name__ == "__main__":
+        app.run(host="0.0.0.0", port=PORT)
+---
+# Deployment for the alerts dashboard
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alerts-dashboard
+  namespace: plane-track
+  labels:
+    app: alerts-dashboard
+    app.kubernetes.io/part-of: plane-track
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alerts-dashboard
+  template:
+    metadata:
+      labels:
+        app: alerts-dashboard
+    spec:
+      serviceAccountName: plane-track-sa
+      initContainers:
+        - name: pip-install
+          image: docker.io/python:3.12-slim
+          command:
+            - /bin/sh
+            - -c
+            - |
+              pip install --quiet --no-cache-dir flask kafka-python-ng requests --target /deps ; rm -rf /deps/kafka-[0-9]*.dist-info 2>/dev/null ; echo "deps ready"
+          volumeMounts:
+            - name: deps
+              mountPath: /deps
+      containers:
+        - name: dashboard
+          image: docker.io/python:3.12-slim
+          command:
+            - /bin/sh
+            - -c
+            - |
+              export PYTHONPATH=/deps
+              python /scripts/app.py
+          env:
+            - name: PORT
+              value: "8080"
+            - name: KAFKA_BOOTSTRAP
+              value: "broker:29092"
+          ports:
+            - name: http
+              containerPort: 8080
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "256Mi"
+              cpu: "200m"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 25
+            periodSeconds: 20
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+            - name: deps
+              mountPath: /deps
+      volumes:
+        - name: scripts
+          configMap:
+            name: alerts-dashboard-script
+        - name: deps
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alerts-dashboard
+  namespace: plane-track
+spec:
+  selector:
+    app: alerts-dashboard
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: alerts-dashboard
+  namespace: plane-track
+spec:
+  to:
+    kind: Service
+    name: alerts-dashboard
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+
+
+
+
+
