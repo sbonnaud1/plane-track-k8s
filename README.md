@@ -2,7 +2,7 @@
 
 Real-time aviation CEP (Complex Event Processing) pipeline for Paris-Orly airport (ORY), deployed on OpenShift / CRC.
 
-ADS-B state vectors from the [OpenSky Network](https://opensky-network.org/) are streamed through Apache Kafka into five Flink SQL jobs that detect flight anomalies in real time. A Flask dashboard surfaces live alerts with per-event detail drawers.
+ADS-B state vectors from the [OpenSky Network](https://opensky-network.org/) are streamed through Apache Kafka into five Flink SQL jobs that detect flight anomalies in real time. A Flask dashboard surfaces live alerts with per-event detail drawers, a live flight map, and Prometheus metrics. A Grafana dashboard tracks pipeline health and CEP alert rates.
 
 ---
 
@@ -34,9 +34,20 @@ adsb-producer  ─────────────────────�
       │           (all 5 output topics)              │
       ▼                                              ▼
 alerts-dashboard (Flask)                    test_cep.py (validation)
+         │
+         ▼
+  /metrics (Prometheus)
+         │
+         ▼
+ServiceMonitor (test-app)
+         │
+         ▼
+  Grafana dashboard
 ```
 
 All components run in the `plane-track` namespace. No image builds are required — Python scripts are injected via ConfigMaps and executed inside stock `python:3.12-slim` and `flink-sql-client-kafka:1.19.1` images.
+
+Grafana and the Prometheus proxy live in the separate `test-app` namespace (shared with the `aviation-tracker` companion app).
 
 ---
 
@@ -55,7 +66,7 @@ All components run in the `plane-track` namespace. No image builds are required 
 | `06-kafka-topics.yaml` | Topic creation job | 6 topics, 1 partition, RF 1 |
 | `07-adsb-producer.yaml` | ADS-B producer | Polls OpenSky v2 API every 60 s |
 | `08-flink-sql-ory.yaml` | Flink SQL CEP jobs | 5 self-contained SQL files |
-| `09-alerts-dashboard.yaml` | Flask alerts dashboard | Single-page app, SSE polling |
+| `09-alerts-dashboard.yaml` | Flask alerts dashboard | Single-page app, SSE polling · `/metrics` endpoint (prometheus-flask-exporter) |
 | `10-adsb-simulator.yaml` | ADS-B simulator | Synthetic events, `replicas: 0` by default |
 | `flink-sql-resubmit-pod.yaml` | Manual recovery Pod | Resubmits all 5 CEP jobs |
 
@@ -208,13 +219,14 @@ oc logs -n plane-track deploy/flink-jobmanager -c sql-resubmit-watchdog -f
 oc get route -n plane-track alerts-dashboard -o jsonpath='{.spec.host}'
 ```
 
-Open `https://<route-host>` in a browser. Four tabs are available:
+Open `https://<route-host>` in a browser. Five tabs are available:
 
 | Tab | Content |
 |---|---|
 | 🧪 **Simulated** | Alerts from the ADS-B simulator (`SIM*` aircraft). Start/Stop/Reset buttons control the simulator pod directly from the UI. |
 | 📡 **Live — OpenSky ADS-B** | Alerts from real ORY traffic. Appears only when actual aircraft are in the approach bounding box. |
 | 🧪 **Simulated Flight Events** | Raw `adsb_raw` vectors from the simulator — shows individual ADS-B messages as they flow through Kafka. |
+| 🗺️ **Aviation Flight Tracker** | Live interactive Leaflet map. Plots all aircraft currently in the ORY zone (48.10–49.15°N / 1.90–2.90°E) sourced from the OpenSky `/states/all` API (60 s cache). Each aircraft marker shows ICAO24, callsign, altitude, speed, and heading. |
 | 📖 **About & Architecture** | CEP pattern descriptions, thresholds, architecture diagram, and tech stack. |
 
 Each alert card shows type, aircraft ID, key metrics, UTC timestamp, and age. Click **View details →** for a full detail drawer with flight profile diagram.
@@ -376,13 +388,64 @@ Expected output: `TOTAL: 53 checks — 53 PASS  0 FAIL`
 
 ---
 
+## Monitoring
+
+The alerts-dashboard exposes a `/metrics` endpoint scraped by the OpenShift user-workload Prometheus every 15 seconds.
+
+### Custom Prometheus metrics
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `cep_alerts_total` | Counter | `topic`, `source` | Total CEP alerts accepted (after dedup). `source` = `live` or `simulated`. |
+| `cep_alerts_in_window` | Gauge | `topic`, `source` | Current number of alerts held in the dashboard deque (snapshot every 10 s). |
+| `adsb_raw_vectors_total` | Gauge | — | Number of raw ADS-B vectors currently held in memory. |
+
+`topic` values: `ory_missed_approach`, `ory_twin_landing`, `ory_repeated_goaround`, `ory_rapid_descent`, `ory_corridor_overload`.
+
+### Grafana dashboard
+
+A pre-provisioned Grafana dashboard (`uid: plane-track`) is defined in `monitoring-plane-track-dashboard.yaml`. It is loaded automatically via a ConfigMap with label `grafana-dashboard: "true"` in the `test-app` namespace.
+
+Panels:
+- **Pipeline Health** — UP/DOWN stat per deployment (Kafka, Schema Registry, Flink JM/TM, ADS-B producer, alerts-dashboard)
+- **ADS-B + Pods** — simulator state, pod count, total restarts, deployments ready, ADS-B vectors in memory, dashboard uptime
+- **CEP Alertes — Compteurs par type** — one stat panel per CEP type (🔴🟡🔁🔻🔵) + Σ total; shows both window snapshot and cumulative count
+- **Alertes CEP — total accumulé** — time series counter per topic
+- **Alertes CEP — taux/min** — `rate[5m] * 60` per topic
+- **Alertes dans la fenêtre** — live vs simulated deque snapshot over time
+- **Restarts par composant** — per-container restart time series
+- **CPU & Mémoire** — `container_cpu_usage_seconds_total` and `container_memory_rss` per container
+- **Réseau Pipeline** — `container_network_receive/transmit_bytes_total` per pod
+
+### ServiceMonitor setup
+
+The ServiceMonitor lives in `test-app` (where the user-workload Prometheus picks it up) and targets the `alerts-dashboard` Service in `plane-track`:
+
+```yaml
+# in 09-alerts-dashboard.yaml
+kind: ServiceMonitor
+namespace: test-app
+spec:
+  namespaceSelector:
+    matchNames: [plane-track]
+  selector:
+    matchLabels:
+      app: alerts-dashboard
+```
+
+A `RoleBinding` (`prometheus-user-workload-scrape`) grants the `prometheus-user-workload` ServiceAccount `view` access on the `plane-track` namespace so it can scrape pod endpoints.
+
+---
+
 ## Tech stack
 
 - **Apache Kafka 3.7** (KRaft, no ZooKeeper) — `apache/kafka:3.7.0`
 - **Apache Flink 1.19** — `cnfldemos/flink-kafka:1.19.1-scala_2.12-java17` (JM + TM) · `cnfldemos/flink-sql-client-kafka:1.19.1-scala_2.12-java17` (watchdog + recovery pod)
 - **Confluent Schema Registry 7.9** — `confluentinc/cp-schema-registry:7.9.0`
-- **Python 3.12** — producer, simulator, dashboard (`kafka-python-ng`, `flask`, `requests`)
+- **Python 3.12** — producer, simulator, dashboard (`kafka-python-ng`, `flask`, `requests`, `prometheus-flask-exporter`, `prometheus-client`)
 - **OpenShift / CRC** — `anyuid` SCC, Routes for external access
+- **Prometheus** — OpenShift user-workload monitoring; custom CEP counters via `prometheus-flask-exporter`
+- **Grafana** — provisioned via ConfigMap in `test-app`; datasource via `thanos-querier` proxy
 
 ---
 
@@ -411,3 +474,14 @@ Expected output: `TOTAL: 53 checks — 53 PASS  0 FAIL`
 | `09-alerts-dashboard.yaml` | Twin Landing About section, popover, and detail drawer labelled the detection window as `TUMBLE(5 min)` | Corrected to `HOP(90 s width, 10 s slide)` to match the actual CEP2 SQL query; source topic in drawer also corrected to `ory_short_final` |
 | `08-flink-sql-ory.yaml` + `09-alerts-dashboard.yaml` | CEP4 Corridor Overload used a `TUMBLE(5 min)` window — the demo cadence (~18 s scenario) could wait up to 5 min for an alert, making it appear that CO never fired | Reduced to `TUMBLE(30 s)`; simulator comment and all dashboard labels updated to match |
 | `10-adsb-simulator.yaml` | After the Twin Landing scenario, no events flowed through `ory_short_final` (the SIM000 background tick at 8 000 m is above the 500 m filter), so the Flink watermark for CEP2's HOP windows stalled and windows never closed → zero TW alerts | Added a 10-event watermark nudge (`SIMWM1`, 490 m, RWY_06 axis) after each TW scenario; `SIMWM1` icao24 sorts after `SIM003` so it never forms a false pair |
+
+### 2026 — Aviation Flight Tracker tab + Prometheus monitoring
+
+| File | Change |
+|---|---|
+| `09-alerts-dashboard.yaml` | New tab **🗺️ Aviation Flight Tracker**: Leaflet map of live ORY zone aircraft. New routes: `GET /api/tracker` (OpenSky proxy, 60 s cache), `GET /static/leaflet.js` (proxied from aviation-tracker sidecar). |
+| `09-alerts-dashboard.yaml` | `prometheus-flask-exporter` + `prometheus-client` added to pip install. Three custom metrics: `cep_alerts_total` (Counter), `cep_alerts_in_window` (Gauge), `adsb_raw_vectors_total` (Gauge). Background thread updates gauges every 10 s. |
+| `09-alerts-dashboard.yaml` | Service: added `labels: app: alerts-dashboard` (required for ServiceMonitor selector). |
+| `09-alerts-dashboard.yaml` | New `RoleBinding` `prometheus-user-workload-scrape` in `plane-track` — grants `view` to `prometheus-user-workload` SA so it can scrape pod endpoints across namespaces. |
+| `09-alerts-dashboard.yaml` | `ServiceMonitor` moved to `test-app` namespace with `namespaceSelector: plane-track`, matching the `aviation-tracker` pattern. |
+| `monitoring-plane-track-dashboard.yaml` | New Grafana dashboard (`uid: plane-track`) — 31 panels covering pipeline health, CEP alert counters by type, time series (accumulation / rate / window), restarts, CPU/RAM, network. |
