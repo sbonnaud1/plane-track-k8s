@@ -48,6 +48,14 @@ data:
 
     app = Flask(__name__)
 
+    # ── Prometheus metrics (/metrics endpoint) ────────────────────────────────
+    try:
+        from prometheus_flask_exporter import PrometheusMetrics
+        _prom = PrometheusMetrics(app, path="/metrics", default_labels={"app": "alerts-dashboard"})
+        _prom.info("alerts_dashboard_info", "Alerts dashboard metadata", version="1.0")
+    except ImportError:
+        pass  # prometheus-flask-exporter not installed — /metrics unavailable
+
     _alerts: deque = deque(maxlen=MAX_ALERTS)
     _raw:    deque = deque(maxlen=MAX_RAW)   # latest raw ADS-B vectors
     _lock          = threading.Lock()
@@ -2641,7 +2649,7 @@ spec:
             - /bin/sh
             - -c
             - |
-              pip install --quiet --no-cache-dir flask kafka-python-ng requests --target /deps ; rm -rf /deps/kafka-[0-9]*.dist-info 2>/dev/null ; echo "deps ready"
+              pip install --quiet --no-cache-dir flask kafka-python-ng requests prometheus-flask-exporter --target /deps ; rm -rf /deps/kafka-[0-9]*.dist-info 2>/dev/null ; echo "deps ready"
           volumeMounts:
             - name: deps
               mountPath: /deps
@@ -2725,3 +2733,22 @@ spec:
 
 
 
+---
+# ServiceMonitor — scrapes /metrics on alerts-dashboard (prometheus-flask-exporter)
+# Picked up by OpenShift user-workload-monitoring Prometheus.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: alerts-dashboard
+  namespace: plane-track
+  labels:
+    app: alerts-dashboard
+    app.kubernetes.io/part-of: plane-track
+spec:
+  selector:
+    matchLabels:
+      app: alerts-dashboard
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s

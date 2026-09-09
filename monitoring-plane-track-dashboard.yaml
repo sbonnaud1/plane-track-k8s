@@ -1,15 +1,12 @@
 ---
 # =============================================================================
-#  Grafana Dashboard — Plane Track / Eurocontrol ORY CEP Pipeline
-#  Sections:
-#    1. Pipeline Health        — déploiement K8s UP/DOWN
-#    2. ADS-B & Simulator      — pods, restarts, état simulateur
-#    3. CEP Alertes métier     — alertes par topic (Kafka offset lag)
-#    4. Activité trafic ORY    — avions tracés, approches, au sol
-#    5. Kafka — Lag & Messages — consumer lag par topic CEP
-#    6. Restarts par composant — time series
-#    7. CPU & Mémoire          — ressources conteneurs
-#    8. Réseau Pipeline        — bytes/s
+#  Grafana Dashboard — Plane Track / ORY CEP Pipeline
+#  All queries use only metrics confirmed available in Prometheus:
+#    - kube-state-metrics  (kube_deployment_*, kube_pod_*)
+#    - cAdvisor            (container_cpu_*, container_memory_*, container_network_*)
+#    - prometheus-flask-exporter on alerts-dashboard (flask_http_request_total, etc.)
+#  Kafka JMX and Flink Prometheus reporter are NOT configured → no kafka_* / flink_* metrics.
+#  CEP business metrics are derived from Flask endpoint call rates.
 # =============================================================================
 apiVersion: v1
 kind: ConfigMap
@@ -105,7 +102,7 @@ data:
 
         {
           "id": 8, "type": "stat", "title": "ADS-B Simulator",
-          "gridPos": {"x":0,"y":6,"w":6,"h":4},
+          "gridPos": {"x":0,"y":6,"w":4,"h":4},
           "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
           "targets": [{"expr":"kube_deployment_status_replicas_available{namespace=\"plane-track\",deployment=\"adsb-simulator\"}","legendFormat":"","refId":"A"}],
           "options": {"colorMode":"background","graphMode":"none","reduceOptions":{"calcs":["lastNotNull"]}},
@@ -116,7 +113,7 @@ data:
         },
         {
           "id": 16, "type": "stat", "title": "Pods Running (total)",
-          "gridPos": {"x":6,"y":6,"w":6,"h":4},
+          "gridPos": {"x":4,"y":6,"w":4,"h":4},
           "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
           "targets": [{"expr":"count(kube_pod_info{namespace=\"plane-track\"})","legendFormat":"","refId":"A"}],
           "options": {"colorMode":"value","graphMode":"none","reduceOptions":{"calcs":["lastNotNull"]}},
@@ -124,7 +121,7 @@ data:
         },
         {
           "id": 17, "type": "stat", "title": "Total Restarts Pipeline",
-          "gridPos": {"x":12,"y":6,"w":6,"h":4},
+          "gridPos": {"x":8,"y":6,"w":4,"h":4},
           "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
           "targets": [{"expr":"sum(kube_pod_container_status_restarts_total{namespace=\"plane-track\"})","legendFormat":"","refId":"A"}],
           "options": {"colorMode":"background","graphMode":"area","reduceOptions":{"calcs":["lastNotNull"]}},
@@ -132,179 +129,110 @@ data:
         },
         {
           "id": 18, "type": "stat", "title": "Deployments Ready / 7",
-          "gridPos": {"x":18,"y":6,"w":6,"h":4},
+          "gridPos": {"x":12,"y":6,"w":4,"h":4},
           "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
           "targets": [{"expr":"count(kube_deployment_status_replicas_available{namespace=\"plane-track\"} == kube_deployment_spec_replicas{namespace=\"plane-track\"})","legendFormat":"","refId":"A"}],
           "options": {"colorMode":"background","graphMode":"none","reduceOptions":{"calcs":["lastNotNull"]}},
           "fieldConfig": {"defaults":{"thresholds":{"mode":"absolute","steps":[{"color":"red","value":null},{"color":"orange","value":5},{"color":"green","value":7}]}}}
         },
+        {
+          "id": 80, "type": "stat", "title": "Flink CEP Jobs RUNNING",
+          "gridPos": {"x":16,"y":6,"w":4,"h":4},
+          "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
+          "targets": [{"expr":"sum(kube_pod_container_status_running{namespace=\"plane-track\",container=~\"flink-.*\"})","legendFormat":"","refId":"A"}],
+          "options": {"colorMode":"background","graphMode":"none","reduceOptions":{"calcs":["lastNotNull"]}},
+          "fieldConfig": {"defaults":{"thresholds":{"mode":"absolute","steps":[{"color":"red","value":null},{"color":"orange","value":1},{"color":"green","value":2}]}}}
+        },
+        {
+          "id": 81, "type": "stat", "title": "Dashboard — Uptime",
+          "gridPos": {"x":20,"y":6,"w":4,"h":4},
+          "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
+          "targets": [{"expr":"process_start_time_seconds{job=\"alerts-dashboard\"}","legendFormat":"","refId":"A"}],
+          "options": {"colorMode":"value","graphMode":"none","reduceOptions":{"calcs":["lastNotNull"]}},
+          "fieldConfig": {"defaults":{"unit":"dateTimeFromNow"}}
+        },
 
-        { "id": 50, "type": "row", "title": "\u2708 CEP Alertes M\u00e9tier — Topics Kafka", "gridPos": {"x":0,"y":10,"w":24,"h":1}, "collapsed": false },
+        { "id": 50, "type": "row", "title": "\u2708 CEP Activit\u00e9 \u2014 Alertes & Trafic ORY (via Flask /metrics)", "gridPos": {"x":0,"y":10,"w":24,"h":1}, "collapsed": false },
 
         {
-          "id": 51, "type": "stat", "title": "\ud83d\udd34 Missed Approach",
+          "id": 51, "type": "stat", "title": "Req totales /api/alerts",
           "gridPos": {"x":0,"y":11,"w":4,"h":4},
           "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
-          "targets": [{"expr":"kafka_log_log_size{topic=\"ory_missed_approach\",namespace=\"plane-track\"} or kube_pod_container_status_running{namespace=\"plane-track\",container=\"broker\"} * 0","legendFormat":"messages","refId":"A"}],
-          "options": {"colorMode":"background","graphMode":"area","reduceOptions":{"calcs":["lastNotNull"]}},
-          "fieldConfig": {"defaults":{"thresholds":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"orange","value":5},{"color":"red","value":20}]},"unit":"short"}}
+          "targets": [{"expr":"sum(flask_http_request_total{job=\"alerts-dashboard\",path=\"/api/alerts\",status=\"200\"}) or vector(0)","legendFormat":"","refId":"A"}],
+          "options": {"colorMode":"value","graphMode":"area","reduceOptions":{"calcs":["lastNotNull"]}},
+          "fieldConfig": {"defaults":{"unit":"short","thresholds":{"mode":"absolute","steps":[{"color":"blue","value":null}]}}}
         },
         {
-          "id": 52, "type": "stat", "title": "\ud83d\udfe1 Twin Landing",
+          "id": 52, "type": "stat", "title": "Req totales /api/raw",
           "gridPos": {"x":4,"y":11,"w":4,"h":4},
           "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
-          "targets": [{"expr":"kafka_log_log_size{topic=\"ory_twin_landing\",namespace=\"plane-track\"} or kube_pod_container_status_running{namespace=\"plane-track\",container=\"broker\"} * 0","legendFormat":"messages","refId":"A"}],
-          "options": {"colorMode":"background","graphMode":"area","reduceOptions":{"calcs":["lastNotNull"]}},
-          "fieldConfig": {"defaults":{"thresholds":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"orange","value":3},{"color":"red","value":10}]},"unit":"short"}}
+          "targets": [{"expr":"sum(flask_http_request_total{job=\"alerts-dashboard\",path=\"/api/raw\",status=\"200\"}) or vector(0)","legendFormat":"","refId":"A"}],
+          "options": {"colorMode":"value","graphMode":"area","reduceOptions":{"calcs":["lastNotNull"]}},
+          "fieldConfig": {"defaults":{"unit":"short","thresholds":{"mode":"absolute","steps":[{"color":"blue","value":null}]}}}
         },
         {
-          "id": 53, "type": "stat", "title": "\ud83d\udd01 Repeat Go-Around",
+          "id": 53, "type": "stat", "title": "Req totales /api/tracker",
           "gridPos": {"x":8,"y":11,"w":4,"h":4},
           "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
-          "targets": [{"expr":"kafka_log_log_size{topic=\"ory_repeated_goaround\",namespace=\"plane-track\"} or kube_pod_container_status_running{namespace=\"plane-track\",container=\"broker\"} * 0","legendFormat":"messages","refId":"A"}],
-          "options": {"colorMode":"background","graphMode":"area","reduceOptions":{"calcs":["lastNotNull"]}},
-          "fieldConfig": {"defaults":{"thresholds":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"orange","value":2},{"color":"red","value":5}]},"unit":"short"}}
+          "targets": [{"expr":"sum(flask_http_request_total{job=\"alerts-dashboard\",path=\"/api/tracker\",status=\"200\"}) or vector(0)","legendFormat":"","refId":"A"}],
+          "options": {"colorMode":"value","graphMode":"area","reduceOptions":{"calcs":["lastNotNull"]}},
+          "fieldConfig": {"defaults":{"unit":"short","thresholds":{"mode":"absolute","steps":[{"color":"blue","value":null}]}}}
         },
         {
-          "id": 54, "type": "stat", "title": "\ud83d\udd3b Rapid Descent",
+          "id": 54, "type": "stat", "title": "Erreurs 5xx Dashboard",
           "gridPos": {"x":12,"y":11,"w":4,"h":4},
-          "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
-          "targets": [{"expr":"kafka_log_log_size{topic=\"ory_rapid_descent\",namespace=\"plane-track\"} or kube_pod_container_status_running{namespace=\"plane-track\",container=\"broker\"} * 0","legendFormat":"messages","refId":"A"}],
-          "options": {"colorMode":"background","graphMode":"area","reduceOptions":{"calcs":["lastNotNull"]}},
-          "fieldConfig": {"defaults":{"thresholds":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"orange","value":2},{"color":"red","value":5}]},"unit":"short"}}
-        },
-        {
-          "id": 55, "type": "stat", "title": "\ud83d\udd35 Corridor Overload",
-          "gridPos": {"x":16,"y":11,"w":4,"h":4},
-          "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
-          "targets": [{"expr":"kafka_log_log_size{topic=\"ory_corridor_overload\",namespace=\"plane-track\"} or kube_pod_container_status_running{namespace=\"plane-track\",container=\"broker\"} * 0","legendFormat":"messages","refId":"A"}],
-          "options": {"colorMode":"background","graphMode":"area","reduceOptions":{"calcs":["lastNotNull"]}},
-          "fieldConfig": {"defaults":{"thresholds":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"orange","value":2},{"color":"red","value":5}]},"unit":"short"}}
-        },
-        {
-          "id": 56, "type": "stat", "title": "\ud83d\udce1 ADS-B Raw (adsb_raw)",
-          "gridPos": {"x":20,"y":11,"w":4,"h":4},
-          "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
-          "targets": [{"expr":"kafka_log_log_size{topic=\"adsb_raw\",namespace=\"plane-track\"} or kube_pod_container_status_running{namespace=\"plane-track\",container=\"broker\"} * 0","legendFormat":"messages","refId":"A"}],
-          "options": {"colorMode":"value","graphMode":"area","reduceOptions":{"calcs":["lastNotNull"]}},
-          "fieldConfig": {"defaults":{"thresholds":{"mode":"absolute","steps":[{"color":"blue","value":null}]},"unit":"short"}}
-        },
-
-        {
-          "id": 57, "type": "timeseries", "title": "Taux d'alertes CEP par topic (messages Kafka / min)",
-          "gridPos": {"x":0,"y":15,"w":24,"h":8},
-          "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
-          "targets": [
-            {"expr":"rate(kafka_log_log_size{topic=\"ory_missed_approach\",namespace=\"plane-track\"}[2m]) * 60","legendFormat":"\ud83d\udd34 Missed Approach","refId":"A"},
-            {"expr":"rate(kafka_log_log_size{topic=\"ory_twin_landing\",namespace=\"plane-track\"}[2m]) * 60","legendFormat":"\ud83d\udfe1 Twin Landing","refId":"B"},
-            {"expr":"rate(kafka_log_log_size{topic=\"ory_repeated_goaround\",namespace=\"plane-track\"}[2m]) * 60","legendFormat":"\ud83d\udd01 Repeat Go-Around","refId":"C"},
-            {"expr":"rate(kafka_log_log_size{topic=\"ory_rapid_descent\",namespace=\"plane-track\"}[2m]) * 60","legendFormat":"\ud83d\udd3b Rapid Descent","refId":"D"},
-            {"expr":"rate(kafka_log_log_size{topic=\"ory_corridor_overload\",namespace=\"plane-track\"}[2m]) * 60","legendFormat":"\ud83d\udd35 Corridor Overload","refId":"E"}
-          ],
-          "fieldConfig": {"defaults":{"unit":"short","custom":{"lineWidth":2,"fillOpacity":10},"color":{"mode":"palette-classic"}}},
-          "options": {"tooltip":{"mode":"multi"}}
-        },
-
-        { "id": 60, "type": "row", "title": "\ud83c\udff3 Activit\u00e9 Trafic ORY — ADS-B Live", "gridPos": {"x":0,"y":23,"w":24,"h":1}, "collapsed": false },
-
-        {
-          "id": 61, "type": "stat", "title": "Flask — Req /api/tracker (total)",
-          "gridPos": {"x":0,"y":24,"w":6,"h":4},
-          "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
-          "targets": [{"expr":"sum(flask_http_request_total{job=\"alerts-dashboard\",path=\"/api/tracker\"}) or vector(0)","legendFormat":"","refId":"A"}],
-          "options": {"colorMode":"value","graphMode":"area","reduceOptions":{"calcs":["lastNotNull"]}},
-          "fieldConfig": {"defaults":{"unit":"short"}}
-        },
-        {
-          "id": 62, "type": "stat", "title": "Flask — Req /api/alerts (total)",
-          "gridPos": {"x":6,"y":24,"w":6,"h":4},
-          "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
-          "targets": [{"expr":"sum(flask_http_request_total{job=\"alerts-dashboard\",path=\"/api/alerts\"}) or vector(0)","legendFormat":"","refId":"A"}],
-          "options": {"colorMode":"value","graphMode":"area","reduceOptions":{"calcs":["lastNotNull"]}},
-          "fieldConfig": {"defaults":{"unit":"short"}}
-        },
-        {
-          "id": 63, "type": "stat", "title": "Flask — Erreurs 5xx Dashboard",
-          "gridPos": {"x":12,"y":24,"w":6,"h":4},
           "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
           "targets": [{"expr":"sum(flask_http_request_total{job=\"alerts-dashboard\",status=~\"5..\"}) or vector(0)","legendFormat":"","refId":"A"}],
           "options": {"colorMode":"background","graphMode":"none","reduceOptions":{"calcs":["lastNotNull"]}},
           "fieldConfig": {"defaults":{"thresholds":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"red","value":1}]}}}
         },
         {
-          "id": 64, "type": "stat", "title": "Dashboard — Uptime",
-          "gridPos": {"x":18,"y":24,"w":6,"h":4},
+          "id": 55, "type": "stat", "title": "Req /sim/start+stop+reset",
+          "gridPos": {"x":16,"y":11,"w":4,"h":4},
           "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
-          "targets": [{"expr":"process_start_time_seconds{job=\"alerts-dashboard\"} or kube_deployment_status_replicas_available{namespace=\"plane-track\",deployment=\"alerts-dashboard\"} * 0","legendFormat":"","refId":"A"}],
-          "options": {"colorMode":"value","graphMode":"none","reduceOptions":{"calcs":["lastNotNull"]}},
-          "fieldConfig": {"defaults":{"unit":"dateTimeFromNow"}}
+          "targets": [{"expr":"sum(flask_http_request_total{job=\"alerts-dashboard\",path=~\"/sim/.*\"}) or vector(0)","legendFormat":"","refId":"A"}],
+          "options": {"colorMode":"value","graphMode":"area","reduceOptions":{"calcs":["lastNotNull"]}},
+          "fieldConfig": {"defaults":{"unit":"short"}}
+        },
+        {
+          "id": 56, "type": "stat", "title": "Flink Health checks",
+          "gridPos": {"x":20,"y":11,"w":4,"h":4},
+          "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
+          "targets": [{"expr":"sum(flask_http_request_total{job=\"alerts-dashboard\",path=\"/api/health\"}) or vector(0)","legendFormat":"","refId":"A"}],
+          "options": {"colorMode":"value","graphMode":"area","reduceOptions":{"calcs":["lastNotNull"]}},
+          "fieldConfig": {"defaults":{"unit":"short"}}
         },
 
         {
-          "id": 65, "type": "timeseries", "title": "Dashboard — Requêtes/s par endpoint",
-          "gridPos": {"x":0,"y":28,"w":12,"h":8},
+          "id": 57, "type": "timeseries", "title": "Dashboard — Requêtes/s par endpoint (proxy activité CEP)",
+          "gridPos": {"x":0,"y":15,"w":12,"h":8},
           "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
           "targets": [
-            {"expr":"rate(flask_http_request_total{job=\"alerts-dashboard\",path=\"/api/alerts\"}[1m])","legendFormat":"GET /api/alerts","refId":"A"},
-            {"expr":"rate(flask_http_request_total{job=\"alerts-dashboard\",path=\"/api/tracker\"}[1m])","legendFormat":"GET /api/tracker","refId":"B"},
-            {"expr":"rate(flask_http_request_total{job=\"alerts-dashboard\",path=\"/api/raw\"}[1m])","legendFormat":"GET /api/raw","refId":"C"},
-            {"expr":"rate(flask_http_request_total{job=\"alerts-dashboard\",path=\"/api/health\"}[1m])","legendFormat":"GET /api/health","refId":"D"},
-            {"expr":"rate(flask_http_request_total{job=\"alerts-dashboard\",path=\"/\"}[1m])","legendFormat":"GET /","refId":"E"}
+            {"expr":"rate(flask_http_request_total{job=\"alerts-dashboard\",path=\"/api/alerts\"}[1m])","legendFormat":"GET /api/alerts (alertes CEP)","refId":"A"},
+            {"expr":"rate(flask_http_request_total{job=\"alerts-dashboard\",path=\"/api/raw\"}[1m])","legendFormat":"GET /api/raw (adsb_raw)","refId":"B"},
+            {"expr":"rate(flask_http_request_total{job=\"alerts-dashboard\",path=\"/api/tracker\"}[1m])","legendFormat":"GET /api/tracker (ORY live)","refId":"C"},
+            {"expr":"rate(flask_http_request_total{job=\"alerts-dashboard\",path=\"/\"}[1m])","legendFormat":"GET / (page vue)","refId":"D"}
           ],
-          "fieldConfig": {"defaults":{"unit":"reqps","custom":{"lineWidth":2},"color":{"mode":"palette-classic"}}}
+          "fieldConfig": {"defaults":{"unit":"reqps","custom":{"lineWidth":2,"fillOpacity":8},"color":{"mode":"palette-classic"}}},
+          "options": {"tooltip":{"mode":"multi"}}
         },
         {
-          "id": 66, "type": "timeseries", "title": "Dashboard — Latence moyenne par endpoint (s)",
-          "gridPos": {"x":12,"y":28,"w":12,"h":8},
+          "id": 58, "type": "timeseries", "title": "Dashboard — Latence moyenne par endpoint (s)",
+          "gridPos": {"x":12,"y":15,"w":12,"h":8},
           "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
           "targets": [
             {"expr":"rate(flask_http_request_duration_seconds_sum{job=\"alerts-dashboard\",path=\"/api/alerts\"}[1m]) / rate(flask_http_request_duration_seconds_count{job=\"alerts-dashboard\",path=\"/api/alerts\"}[1m])","legendFormat":"latence /api/alerts","refId":"A"},
-            {"expr":"rate(flask_http_request_duration_seconds_sum{job=\"alerts-dashboard\",path=\"/api/tracker\"}[1m]) / rate(flask_http_request_duration_seconds_count{job=\"alerts-dashboard\",path=\"/api/tracker\"}[1m])","legendFormat":"latence /api/tracker","refId":"B"},
-            {"expr":"rate(flask_http_request_duration_seconds_sum{job=\"alerts-dashboard\",path=\"/api/raw\"}[1m]) / rate(flask_http_request_duration_seconds_count{job=\"alerts-dashboard\",path=\"/api/raw\"}[1m])","legendFormat":"latence /api/raw","refId":"C"}
+            {"expr":"rate(flask_http_request_duration_seconds_sum{job=\"alerts-dashboard\",path=\"/api/raw\"}[1m]) / rate(flask_http_request_duration_seconds_count{job=\"alerts-dashboard\",path=\"/api/raw\"}[1m])","legendFormat":"latence /api/raw","refId":"B"},
+            {"expr":"rate(flask_http_request_duration_seconds_sum{job=\"alerts-dashboard\",path=\"/api/tracker\"}[1m]) / rate(flask_http_request_duration_seconds_count{job=\"alerts-dashboard\",path=\"/api/tracker\"}[1m])","legendFormat":"latence /api/tracker","refId":"C"}
           ],
           "fieldConfig": {"defaults":{"unit":"s","custom":{"lineWidth":2},"color":{"mode":"palette-classic"}}}
         },
 
-        { "id": 70, "type": "row", "title": "\ud83d\udce6 Kafka — Consumer Lag & Taille topics", "gridPos": {"x":0,"y":36,"w":24,"h":1}, "collapsed": false },
-
-        {
-          "id": 71, "type": "timeseries", "title": "Kafka — Taille topics CEP (offsets / messages totaux)",
-          "gridPos": {"x":0,"y":37,"w":24,"h":8},
-          "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
-          "targets": [
-            {"expr":"kafka_log_log_size{topic=\"adsb_raw\",namespace=\"plane-track\"}","legendFormat":"adsb_raw","refId":"A"},
-            {"expr":"kafka_log_log_size{topic=\"ory_missed_approach\",namespace=\"plane-track\"}","legendFormat":"ory_missed_approach","refId":"B"},
-            {"expr":"kafka_log_log_size{topic=\"ory_twin_landing\",namespace=\"plane-track\"}","legendFormat":"ory_twin_landing","refId":"C"},
-            {"expr":"kafka_log_log_size{topic=\"ory_repeated_goaround\",namespace=\"plane-track\"}","legendFormat":"ory_repeated_goaround","refId":"D"},
-            {"expr":"kafka_log_log_size{topic=\"ory_rapid_descent\",namespace=\"plane-track\"}","legendFormat":"ory_rapid_descent","refId":"E"},
-            {"expr":"kafka_log_log_size{topic=\"ory_corridor_overload\",namespace=\"plane-track\"}","legendFormat":"ory_corridor_overload","refId":"F"}
-          ],
-          "fieldConfig": {"defaults":{"unit":"short","custom":{"lineWidth":1,"fillOpacity":8},"color":{"mode":"palette-classic"}}},
-          "options": {"tooltip":{"mode":"multi"}}
-        },
-
-        {
-          "id": 72, "type": "timeseries", "title": "Kafka — Consumer Lag dashboard (messages en attente par topic)",
-          "gridPos": {"x":0,"y":45,"w":24,"h":8},
-          "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
-          "targets": [
-            {"expr":"kafka_consumergroup_lag{topic=\"ory_missed_approach\",namespace=\"plane-track\"} or kafka_consumer_lag_millis{topic=\"ory_missed_approach\",namespace=\"plane-track\"} / 1000","legendFormat":"lag ory_missed_approach","refId":"A"},
-            {"expr":"kafka_consumergroup_lag{topic=\"ory_twin_landing\",namespace=\"plane-track\"}","legendFormat":"lag ory_twin_landing","refId":"B"},
-            {"expr":"kafka_consumergroup_lag{topic=\"ory_repeated_goaround\",namespace=\"plane-track\"}","legendFormat":"lag ory_repeated_goaround","refId":"C"},
-            {"expr":"kafka_consumergroup_lag{topic=\"ory_rapid_descent\",namespace=\"plane-track\"}","legendFormat":"lag ory_rapid_descent","refId":"D"},
-            {"expr":"kafka_consumergroup_lag{topic=\"ory_corridor_overload\",namespace=\"plane-track\"}","legendFormat":"lag ory_corridor_overload","refId":"E"},
-            {"expr":"kafka_consumergroup_lag{topic=\"adsb_raw\",namespace=\"plane-track\"}","legendFormat":"lag adsb_raw","refId":"F"}
-          ],
-          "fieldConfig": {"defaults":{"unit":"short","custom":{"lineWidth":2},"color":{"mode":"palette-classic"},
-            "thresholds":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"orange","value":100},{"color":"red","value":1000}]}}},
-          "options": {"tooltip":{"mode":"multi"}}
-        },
-
-        { "id": 19, "type": "row", "title": "\ud83d\udd04 Restarts par composant", "gridPos": {"x":0,"y":53,"w":24,"h":1}, "collapsed": false },
+        { "id": 19, "type": "row", "title": "\ud83d\udd04 Restarts par composant", "gridPos": {"x":0,"y":23,"w":24,"h":1}, "collapsed": false },
 
         {
           "id": 15, "type": "timeseries", "title": "Pod Restarts par composant",
-          "gridPos": {"x":0,"y":54,"w":24,"h":8},
+          "gridPos": {"x":0,"y":24,"w":24,"h":8},
           "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
           "targets": [
             {"expr":"kube_pod_container_status_restarts_total{namespace=\"plane-track\",container=\"broker\"}","legendFormat":"broker","refId":"A"},
@@ -317,11 +245,11 @@ data:
           "fieldConfig": {"defaults":{"unit":"short","custom":{"lineWidth":2},"color":{"mode":"palette-classic"}}}
         },
 
-        { "id": 20, "type": "row", "title": "\ud83d\udcbe CPU & M\u00e9moire", "gridPos": {"x":0,"y":62,"w":24,"h":1}, "collapsed": false },
+        { "id": 20, "type": "row", "title": "\ud83d\udcbe CPU & M\u00e9moire", "gridPos": {"x":0,"y":32,"w":24,"h":1}, "collapsed": false },
 
         {
           "id": 21, "type": "timeseries", "title": "CPU Usage — composants plane-track",
-          "gridPos": {"x":0,"y":63,"w":12,"h":8},
+          "gridPos": {"x":0,"y":33,"w":12,"h":8},
           "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
           "targets": [
             {"expr":"rate(container_cpu_usage_seconds_total{namespace=\"plane-track\",container!=\"\",container!=\"POD\"}[2m])","legendFormat":"{{container}}","refId":"A"}
@@ -330,7 +258,7 @@ data:
         },
         {
           "id": 22, "type": "timeseries", "title": "M\u00e9moire RSS — composants plane-track",
-          "gridPos": {"x":12,"y":63,"w":12,"h":8},
+          "gridPos": {"x":12,"y":33,"w":12,"h":8},
           "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
           "targets": [
             {"expr":"container_memory_rss{namespace=\"plane-track\",container!=\"\",container!=\"POD\"}","legendFormat":"{{container}}","refId":"A"}
@@ -338,11 +266,11 @@ data:
           "fieldConfig": {"defaults":{"unit":"bytes","custom":{"lineWidth":1},"color":{"mode":"palette-classic"}}}
         },
 
-        { "id": 30, "type": "row", "title": "\ud83c\udf10 R\u00e9seau Pipeline", "gridPos": {"x":0,"y":71,"w":24,"h":1}, "collapsed": false },
+        { "id": 30, "type": "row", "title": "\ud83c\udf10 R\u00e9seau Pipeline", "gridPos": {"x":0,"y":41,"w":24,"h":1}, "collapsed": false },
 
         {
           "id": 41, "type": "timeseries", "title": "R\u00e9seau — tous les pods plane-track (bytes/s)",
-          "gridPos": {"x":0,"y":72,"w":24,"h":8},
+          "gridPos": {"x":0,"y":42,"w":24,"h":8},
           "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
           "targets": [
             {"expr":"sum by (pod) (rate(container_network_receive_bytes_total{namespace=\"plane-track\"}[1m]))","legendFormat":"rx \u2193 {{pod}}","refId":"A"},
