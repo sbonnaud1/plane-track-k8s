@@ -419,19 +419,19 @@ Panels:
 
 ### ServiceMonitor setup
 
-The ServiceMonitor lives in `test-app` (where the user-workload Prometheus picks it up) and targets the `alerts-dashboard` Service in `plane-track`:
+The ServiceMonitor lives in **`plane-track`** — the same namespace as the service it scrapes.
 
 ```yaml
 # in 09-alerts-dashboard.yaml
 kind: ServiceMonitor
-namespace: test-app
+namespace: plane-track      # same namespace as the alerts-dashboard Service
 spec:
-  namespaceSelector:
-    matchNames: [plane-track]
   selector:
     matchLabels:
       app: alerts-dashboard
 ```
+
+> **Why `plane-track` and not `test-app`?** The user-workload Prometheus has `ignoreNamespaceSelectors: true`, which means it always scrapes services in the **same namespace as the ServiceMonitor**, regardless of any `namespaceSelector` field. A ServiceMonitor in `test-app` would only discover services in `test-app` and never reach `plane-track`.
 
 A `RoleBinding` (`prometheus-user-workload-scrape`) grants the `prometheus-user-workload` ServiceAccount `view` access on the `plane-track` namespace so it can scrape pod endpoints.
 

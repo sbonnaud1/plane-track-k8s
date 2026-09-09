@@ -2800,18 +2800,17 @@ subjects:
     namespace: openshift-user-workload-monitoring
 ---
 # ServiceMonitor — scrapes /metrics on alerts-dashboard (prometheus-flask-exporter)
-# Must live in test-app so the user-workload Prometheus picks it up.
+# Must live in plane-track: user-workload Prometheus has ignoreNamespaceSelectors=true,
+# so a ServiceMonitor only scrapes services in its OWN namespace.
+# The namespaceSelector field is therefore irrelevant and intentionally omitted.
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
   name: alerts-dashboard
-  namespace: test-app
+  namespace: plane-track
   labels:
     app: alerts-dashboard
 spec:
-  namespaceSelector:
-    matchNames:
-      - plane-track
   selector:
     matchLabels:
       app: alerts-dashboard
