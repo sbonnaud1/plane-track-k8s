@@ -1,12 +1,14 @@
 ---
 # =============================================================================
 #  Grafana Dashboard — Plane Track / ORY CEP Pipeline
-#  All queries use only metrics confirmed available in Prometheus:
-#    - kube-state-metrics  (kube_deployment_*, kube_pod_*)
-#    - cAdvisor            (container_cpu_*, container_memory_*, container_network_*)
-#    - prometheus-flask-exporter on alerts-dashboard (flask_http_request_total, etc.)
-#  Kafka JMX and Flink Prometheus reporter are NOT configured → no kafka_* / flink_* metrics.
-#  CEP business metrics are derived from Flask endpoint call rates.
+#  Metrics sources:
+#    - kube-state-metrics  : kube_deployment_*, kube_pod_*
+#    - cAdvisor            : container_cpu_*, container_memory_*, container_network_*
+#    - alerts-dashboard /metrics (prometheus-flask-exporter + prometheus_client):
+#        cep_alerts_total{topic, source}         — counter per topic/source
+#        cep_alerts_in_window{topic, source}     — gauge (deque snapshot)
+#        adsb_raw_vectors_total                  — gauge
+#        flask_http_request_total, flask_http_request_duration_seconds_*
 # =============================================================================
 apiVersion: v1
 kind: ConfigMap
@@ -37,10 +39,7 @@ data:
           "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
           "targets": [{"expr":"kube_deployment_status_replicas_available{namespace=\"plane-track\",deployment=\"broker\"}","legendFormat":"","refId":"A"}],
           "options": {"colorMode":"background","graphMode":"none","reduceOptions":{"calcs":["lastNotNull"]}},
-          "fieldConfig": {"defaults":{"mappings":[
-            {"type":"value","options":{"0":{"text":"DOWN","color":"red","index":0}}},
-            {"type":"value","options":{"1":{"text":"UP","color":"green","index":1}}}
-          ],"thresholds":{"mode":"absolute","steps":[]}}}
+          "fieldConfig": {"defaults":{"mappings":[{"type":"value","options":{"0":{"text":"DOWN","color":"red","index":0}}},{"type":"value","options":{"1":{"text":"UP","color":"green","index":1}}}],"thresholds":{"mode":"absolute","steps":[]}}}
         },
         {
           "id": 3, "type": "stat", "title": "Schema Registry",
@@ -48,10 +47,7 @@ data:
           "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
           "targets": [{"expr":"kube_deployment_status_replicas_available{namespace=\"plane-track\",deployment=\"schema-registry\"}","legendFormat":"","refId":"A"}],
           "options": {"colorMode":"background","graphMode":"none","reduceOptions":{"calcs":["lastNotNull"]}},
-          "fieldConfig": {"defaults":{"mappings":[
-            {"type":"value","options":{"0":{"text":"DOWN","color":"red","index":0}}},
-            {"type":"value","options":{"1":{"text":"UP","color":"green","index":1}}}
-          ],"thresholds":{"mode":"absolute","steps":[]}}}
+          "fieldConfig": {"defaults":{"mappings":[{"type":"value","options":{"0":{"text":"DOWN","color":"red","index":0}}},{"type":"value","options":{"1":{"text":"UP","color":"green","index":1}}}],"thresholds":{"mode":"absolute","steps":[]}}}
         },
         {
           "id": 4, "type": "stat", "title": "Flink JobManager",
@@ -59,10 +55,7 @@ data:
           "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
           "targets": [{"expr":"kube_deployment_status_replicas_available{namespace=\"plane-track\",deployment=\"flink-jobmanager\"}","legendFormat":"","refId":"A"}],
           "options": {"colorMode":"background","graphMode":"none","reduceOptions":{"calcs":["lastNotNull"]}},
-          "fieldConfig": {"defaults":{"mappings":[
-            {"type":"value","options":{"0":{"text":"DOWN","color":"red","index":0}}},
-            {"type":"value","options":{"1":{"text":"UP","color":"green","index":1}}}
-          ],"thresholds":{"mode":"absolute","steps":[]}}}
+          "fieldConfig": {"defaults":{"mappings":[{"type":"value","options":{"0":{"text":"DOWN","color":"red","index":0}}},{"type":"value","options":{"1":{"text":"UP","color":"green","index":1}}}],"thresholds":{"mode":"absolute","steps":[]}}}
         },
         {
           "id": 5, "type": "stat", "title": "Flink TaskManager",
@@ -70,10 +63,7 @@ data:
           "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
           "targets": [{"expr":"kube_deployment_status_replicas_available{namespace=\"plane-track\",deployment=\"flink-taskmanager\"}","legendFormat":"","refId":"A"}],
           "options": {"colorMode":"background","graphMode":"none","reduceOptions":{"calcs":["lastNotNull"]}},
-          "fieldConfig": {"defaults":{"mappings":[
-            {"type":"value","options":{"0":{"text":"DOWN","color":"red","index":0}}},
-            {"type":"value","options":{"1":{"text":"UP","color":"green","index":1}}}
-          ],"thresholds":{"mode":"absolute","steps":[]}}}
+          "fieldConfig": {"defaults":{"mappings":[{"type":"value","options":{"0":{"text":"DOWN","color":"red","index":0}}},{"type":"value","options":{"1":{"text":"UP","color":"green","index":1}}}],"thresholds":{"mode":"absolute","steps":[]}}}
         },
         {
           "id": 6, "type": "stat", "title": "ADS-B Producer",
@@ -81,10 +71,7 @@ data:
           "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
           "targets": [{"expr":"kube_deployment_status_replicas_available{namespace=\"plane-track\",deployment=\"adsb-producer\"}","legendFormat":"","refId":"A"}],
           "options": {"colorMode":"background","graphMode":"none","reduceOptions":{"calcs":["lastNotNull"]}},
-          "fieldConfig": {"defaults":{"mappings":[
-            {"type":"value","options":{"0":{"text":"DOWN","color":"red","index":0}}},
-            {"type":"value","options":{"1":{"text":"UP","color":"green","index":1}}}
-          ],"thresholds":{"mode":"absolute","steps":[]}}}
+          "fieldConfig": {"defaults":{"mappings":[{"type":"value","options":{"0":{"text":"DOWN","color":"red","index":0}}},{"type":"value","options":{"1":{"text":"UP","color":"green","index":1}}}],"thresholds":{"mode":"absolute","steps":[]}}}
         },
         {
           "id": 7, "type": "stat", "title": "Alerts Dashboard",
@@ -92,10 +79,7 @@ data:
           "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
           "targets": [{"expr":"kube_deployment_status_replicas_available{namespace=\"plane-track\",deployment=\"alerts-dashboard\"}","legendFormat":"","refId":"A"}],
           "options": {"colorMode":"background","graphMode":"none","reduceOptions":{"calcs":["lastNotNull"]}},
-          "fieldConfig": {"defaults":{"mappings":[
-            {"type":"value","options":{"0":{"text":"DOWN","color":"red","index":0}}},
-            {"type":"value","options":{"1":{"text":"UP","color":"green","index":1}}}
-          ],"thresholds":{"mode":"absolute","steps":[]}}}
+          "fieldConfig": {"defaults":{"mappings":[{"type":"value","options":{"0":{"text":"DOWN","color":"red","index":0}}},{"type":"value","options":{"1":{"text":"UP","color":"green","index":1}}}],"thresholds":{"mode":"absolute","steps":[]}}}
         },
 
         { "id": 9, "type": "row", "title": "\ud83e\uddea ADS-B Simulator & Pods", "gridPos": {"x":0,"y":5,"w":24,"h":1}, "collapsed": false },
@@ -106,10 +90,7 @@ data:
           "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
           "targets": [{"expr":"kube_deployment_status_replicas_available{namespace=\"plane-track\",deployment=\"adsb-simulator\"}","legendFormat":"","refId":"A"}],
           "options": {"colorMode":"background","graphMode":"none","reduceOptions":{"calcs":["lastNotNull"]}},
-          "fieldConfig": {"defaults":{"mappings":[
-            {"type":"value","options":{"0":{"text":"STOPPED","color":"orange","index":0}}},
-            {"type":"value","options":{"1":{"text":"RUNNING","color":"green","index":1}}}
-          ],"thresholds":{"mode":"absolute","steps":[]}}}
+          "fieldConfig": {"defaults":{"mappings":[{"type":"value","options":{"0":{"text":"STOPPED","color":"orange","index":0}}},{"type":"value","options":{"1":{"text":"RUNNING","color":"green","index":1}}}],"thresholds":{"mode":"absolute","steps":[]}}}
         },
         {
           "id": 16, "type": "stat", "title": "Pods Running (total)",
@@ -136,12 +117,12 @@ data:
           "fieldConfig": {"defaults":{"thresholds":{"mode":"absolute","steps":[{"color":"red","value":null},{"color":"orange","value":5},{"color":"green","value":7}]}}}
         },
         {
-          "id": 80, "type": "stat", "title": "Flink CEP Jobs RUNNING",
+          "id": 80, "type": "stat", "title": "ADS-B Vectors en m\u00e9moire",
           "gridPos": {"x":16,"y":6,"w":4,"h":4},
           "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
-          "targets": [{"expr":"sum(kube_pod_container_status_running{namespace=\"plane-track\",container=~\"flink-.*\"})","legendFormat":"","refId":"A"}],
-          "options": {"colorMode":"background","graphMode":"none","reduceOptions":{"calcs":["lastNotNull"]}},
-          "fieldConfig": {"defaults":{"thresholds":{"mode":"absolute","steps":[{"color":"red","value":null},{"color":"orange","value":1},{"color":"green","value":2}]}}}
+          "targets": [{"expr":"adsb_raw_vectors_total{job=\"alerts-dashboard\"} or vector(0)","legendFormat":"","refId":"A"}],
+          "options": {"colorMode":"value","graphMode":"area","reduceOptions":{"calcs":["lastNotNull"]}},
+          "fieldConfig": {"defaults":{"unit":"short","thresholds":{"mode":"absolute","steps":[{"color":"blue","value":null}]}}}
         },
         {
           "id": 81, "type": "stat", "title": "Dashboard — Uptime",
@@ -152,87 +133,125 @@ data:
           "fieldConfig": {"defaults":{"unit":"dateTimeFromNow"}}
         },
 
-        { "id": 50, "type": "row", "title": "\u2708 CEP Activit\u00e9 \u2014 Alertes & Trafic ORY (via Flask /metrics)", "gridPos": {"x":0,"y":10,"w":24,"h":1}, "collapsed": false },
+        { "id": 50, "type": "row", "title": "\u2708 CEP Alertes \u2014 Compteurs par type", "gridPos": {"x":0,"y":10,"w":24,"h":1}, "collapsed": false },
 
         {
-          "id": 51, "type": "stat", "title": "Req totales /api/alerts",
-          "gridPos": {"x":0,"y":11,"w":4,"h":4},
-          "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
-          "targets": [{"expr":"sum(flask_http_request_total{job=\"alerts-dashboard\",path=\"/api/alerts\",status=\"200\"}) or vector(0)","legendFormat":"","refId":"A"}],
-          "options": {"colorMode":"value","graphMode":"area","reduceOptions":{"calcs":["lastNotNull"]}},
-          "fieldConfig": {"defaults":{"unit":"short","thresholds":{"mode":"absolute","steps":[{"color":"blue","value":null}]}}}
-        },
-        {
-          "id": 52, "type": "stat", "title": "Req totales /api/raw",
-          "gridPos": {"x":4,"y":11,"w":4,"h":4},
-          "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
-          "targets": [{"expr":"sum(flask_http_request_total{job=\"alerts-dashboard\",path=\"/api/raw\",status=\"200\"}) or vector(0)","legendFormat":"","refId":"A"}],
-          "options": {"colorMode":"value","graphMode":"area","reduceOptions":{"calcs":["lastNotNull"]}},
-          "fieldConfig": {"defaults":{"unit":"short","thresholds":{"mode":"absolute","steps":[{"color":"blue","value":null}]}}}
-        },
-        {
-          "id": 53, "type": "stat", "title": "Req totales /api/tracker",
-          "gridPos": {"x":8,"y":11,"w":4,"h":4},
-          "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
-          "targets": [{"expr":"sum(flask_http_request_total{job=\"alerts-dashboard\",path=\"/api/tracker\",status=\"200\"}) or vector(0)","legendFormat":"","refId":"A"}],
-          "options": {"colorMode":"value","graphMode":"area","reduceOptions":{"calcs":["lastNotNull"]}},
-          "fieldConfig": {"defaults":{"unit":"short","thresholds":{"mode":"absolute","steps":[{"color":"blue","value":null}]}}}
-        },
-        {
-          "id": 54, "type": "stat", "title": "Erreurs 5xx Dashboard",
-          "gridPos": {"x":12,"y":11,"w":4,"h":4},
-          "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
-          "targets": [{"expr":"sum(flask_http_request_total{job=\"alerts-dashboard\",status=~\"5..\"}) or vector(0)","legendFormat":"","refId":"A"}],
-          "options": {"colorMode":"background","graphMode":"none","reduceOptions":{"calcs":["lastNotNull"]}},
-          "fieldConfig": {"defaults":{"thresholds":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"red","value":1}]}}}
-        },
-        {
-          "id": 55, "type": "stat", "title": "Req /sim/start+stop+reset",
-          "gridPos": {"x":16,"y":11,"w":4,"h":4},
-          "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
-          "targets": [{"expr":"sum(flask_http_request_total{job=\"alerts-dashboard\",path=~\"/sim/.*\"}) or vector(0)","legendFormat":"","refId":"A"}],
-          "options": {"colorMode":"value","graphMode":"area","reduceOptions":{"calcs":["lastNotNull"]}},
-          "fieldConfig": {"defaults":{"unit":"short"}}
-        },
-        {
-          "id": 56, "type": "stat", "title": "Flink Health checks",
-          "gridPos": {"x":20,"y":11,"w":4,"h":4},
-          "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
-          "targets": [{"expr":"sum(flask_http_request_total{job=\"alerts-dashboard\",path=\"/api/health\"}) or vector(0)","legendFormat":"","refId":"A"}],
-          "options": {"colorMode":"value","graphMode":"area","reduceOptions":{"calcs":["lastNotNull"]}},
-          "fieldConfig": {"defaults":{"unit":"short"}}
-        },
-
-        {
-          "id": 57, "type": "timeseries", "title": "Dashboard — Requêtes/s par endpoint (proxy activité CEP)",
-          "gridPos": {"x":0,"y":15,"w":12,"h":8},
+          "id": 51, "type": "stat", "title": "\ud83d\udd34 Missed Approach",
+          "gridPos": {"x":0,"y":11,"w":4,"h":5},
           "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
           "targets": [
-            {"expr":"rate(flask_http_request_total{job=\"alerts-dashboard\",path=\"/api/alerts\"}[1m])","legendFormat":"GET /api/alerts (alertes CEP)","refId":"A"},
-            {"expr":"rate(flask_http_request_total{job=\"alerts-dashboard\",path=\"/api/raw\"}[1m])","legendFormat":"GET /api/raw (adsb_raw)","refId":"B"},
-            {"expr":"rate(flask_http_request_total{job=\"alerts-dashboard\",path=\"/api/tracker\"}[1m])","legendFormat":"GET /api/tracker (ORY live)","refId":"C"},
-            {"expr":"rate(flask_http_request_total{job=\"alerts-dashboard\",path=\"/\"}[1m])","legendFormat":"GET / (page vue)","refId":"D"}
+            {"expr":"sum(cep_alerts_total{job=\"alerts-dashboard\",topic=\"ory_missed_approach\"}) or vector(0)","legendFormat":"Total","refId":"A"},
+            {"expr":"cep_alerts_in_window{job=\"alerts-dashboard\",topic=\"ory_missed_approach\",source=\"live\"} or vector(0)","legendFormat":"Live","refId":"B"},
+            {"expr":"cep_alerts_in_window{job=\"alerts-dashboard\",topic=\"ory_missed_approach\",source=\"simulated\"} or vector(0)","legendFormat":"Sim","refId":"C"}
           ],
-          "fieldConfig": {"defaults":{"unit":"reqps","custom":{"lineWidth":2,"fillOpacity":8},"color":{"mode":"palette-classic"}}},
+          "options": {"colorMode":"background","graphMode":"area","reduceOptions":{"calcs":["lastNotNull"]}},
+          "fieldConfig": {"defaults":{"thresholds":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"orange","value":3},{"color":"red","value":10}]},"unit":"short"}}
+        },
+        {
+          "id": 52, "type": "stat", "title": "\ud83d\udfe1 Twin Landing",
+          "gridPos": {"x":4,"y":11,"w":4,"h":5},
+          "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
+          "targets": [
+            {"expr":"sum(cep_alerts_total{job=\"alerts-dashboard\",topic=\"ory_twin_landing\"}) or vector(0)","legendFormat":"Total","refId":"A"},
+            {"expr":"cep_alerts_in_window{job=\"alerts-dashboard\",topic=\"ory_twin_landing\",source=\"simulated\"} or vector(0)","legendFormat":"Sim","refId":"B"}
+          ],
+          "options": {"colorMode":"background","graphMode":"area","reduceOptions":{"calcs":["lastNotNull"]}},
+          "fieldConfig": {"defaults":{"thresholds":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"orange","value":2},{"color":"red","value":8}]},"unit":"short"}}
+        },
+        {
+          "id": 53, "type": "stat", "title": "\ud83d\udd01 Repeat Go-Around",
+          "gridPos": {"x":8,"y":11,"w":4,"h":5},
+          "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
+          "targets": [
+            {"expr":"sum(cep_alerts_total{job=\"alerts-dashboard\",topic=\"ory_repeated_goaround\"}) or vector(0)","legendFormat":"Total","refId":"A"},
+            {"expr":"cep_alerts_in_window{job=\"alerts-dashboard\",topic=\"ory_repeated_goaround\",source=\"live\"} or vector(0)","legendFormat":"Live","refId":"B"},
+            {"expr":"cep_alerts_in_window{job=\"alerts-dashboard\",topic=\"ory_repeated_goaround\",source=\"simulated\"} or vector(0)","legendFormat":"Sim","refId":"C"}
+          ],
+          "options": {"colorMode":"background","graphMode":"area","reduceOptions":{"calcs":["lastNotNull"]}},
+          "fieldConfig": {"defaults":{"thresholds":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"orange","value":1},{"color":"red","value":3}]},"unit":"short"}}
+        },
+        {
+          "id": 54, "type": "stat", "title": "\ud83d\udd3b Rapid Descent",
+          "gridPos": {"x":12,"y":11,"w":4,"h":5},
+          "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
+          "targets": [
+            {"expr":"sum(cep_alerts_total{job=\"alerts-dashboard\",topic=\"ory_rapid_descent\"}) or vector(0)","legendFormat":"Total","refId":"A"},
+            {"expr":"cep_alerts_in_window{job=\"alerts-dashboard\",topic=\"ory_rapid_descent\",source=\"live\"} or vector(0)","legendFormat":"Live","refId":"B"},
+            {"expr":"cep_alerts_in_window{job=\"alerts-dashboard\",topic=\"ory_rapid_descent\",source=\"simulated\"} or vector(0)","legendFormat":"Sim","refId":"C"}
+          ],
+          "options": {"colorMode":"background","graphMode":"area","reduceOptions":{"calcs":["lastNotNull"]}},
+          "fieldConfig": {"defaults":{"thresholds":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"orange","value":1},{"color":"red","value":3}]},"unit":"short"}}
+        },
+        {
+          "id": 55, "type": "stat", "title": "\ud83d\udd35 Corridor Overload",
+          "gridPos": {"x":16,"y":11,"w":4,"h":5},
+          "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
+          "targets": [
+            {"expr":"sum(cep_alerts_total{job=\"alerts-dashboard\",topic=\"ory_corridor_overload\"}) or vector(0)","legendFormat":"Total","refId":"A"},
+            {"expr":"cep_alerts_in_window{job=\"alerts-dashboard\",topic=\"ory_corridor_overload\",source=\"live\"} or vector(0)","legendFormat":"Live","refId":"B"},
+            {"expr":"cep_alerts_in_window{job=\"alerts-dashboard\",topic=\"ory_corridor_overload\",source=\"simulated\"} or vector(0)","legendFormat":"Sim","refId":"C"}
+          ],
+          "options": {"colorMode":"background","graphMode":"area","reduceOptions":{"calcs":["lastNotNull"]}},
+          "fieldConfig": {"defaults":{"thresholds":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"orange","value":1},{"color":"red","value":3}]},"unit":"short"}}
+        },
+        {
+          "id": 56, "type": "stat", "title": "\u2211 Total alertes (toutes sources)",
+          "gridPos": {"x":20,"y":11,"w":4,"h":5},
+          "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
+          "targets": [
+            {"expr":"sum(cep_alerts_total{job=\"alerts-dashboard\"}) or vector(0)","legendFormat":"Total","refId":"A"}
+          ],
+          "options": {"colorMode":"value","graphMode":"area","reduceOptions":{"calcs":["lastNotNull"]}},
+          "fieldConfig": {"defaults":{"unit":"short","thresholds":{"mode":"absolute","steps":[{"color":"blue","value":null}]}}}
+        },
+
+        {
+          "id": 60, "type": "timeseries", "title": "Alertes CEP \u2014 total accumul\u00e9 par type (counter)",
+          "gridPos": {"x":0,"y":16,"w":24,"h":9},
+          "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
+          "targets": [
+            {"expr":"sum by (topic) (cep_alerts_total{job=\"alerts-dashboard\",topic=\"ory_missed_approach\"})","legendFormat":"\ud83d\udd34 Missed Approach","refId":"A"},
+            {"expr":"sum by (topic) (cep_alerts_total{job=\"alerts-dashboard\",topic=\"ory_twin_landing\"})","legendFormat":"\ud83d\udfe1 Twin Landing","refId":"B"},
+            {"expr":"sum by (topic) (cep_alerts_total{job=\"alerts-dashboard\",topic=\"ory_repeated_goaround\"})","legendFormat":"\ud83d\udd01 Repeat Go-Around","refId":"C"},
+            {"expr":"sum by (topic) (cep_alerts_total{job=\"alerts-dashboard\",topic=\"ory_rapid_descent\"})","legendFormat":"\ud83d\udd3b Rapid Descent","refId":"D"},
+            {"expr":"sum by (topic) (cep_alerts_total{job=\"alerts-dashboard\",topic=\"ory_corridor_overload\"})","legendFormat":"\ud83d\udd35 Corridor Overload","refId":"E"}
+          ],
+          "fieldConfig": {"defaults":{"unit":"short","custom":{"lineWidth":2,"fillOpacity":6},"color":{"mode":"palette-classic"}}},
+          "options": {"tooltip":{"mode":"multi","sort":"desc"}}
+        },
+
+        {
+          "id": 61, "type": "timeseries", "title": "Alertes CEP \u2014 taux par minute par type",
+          "gridPos": {"x":0,"y":25,"w":12,"h":8},
+          "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
+          "targets": [
+            {"expr":"rate(cep_alerts_total{job=\"alerts-dashboard\",topic=\"ory_missed_approach\"}[5m]) * 60","legendFormat":"\ud83d\udd34 Missed Approach","refId":"A"},
+            {"expr":"rate(cep_alerts_total{job=\"alerts-dashboard\",topic=\"ory_twin_landing\"}[5m]) * 60","legendFormat":"\ud83d\udfe1 Twin Landing","refId":"B"},
+            {"expr":"rate(cep_alerts_total{job=\"alerts-dashboard\",topic=\"ory_repeated_goaround\"}[5m]) * 60","legendFormat":"\ud83d\udd01 Repeat Go-Around","refId":"C"},
+            {"expr":"rate(cep_alerts_total{job=\"alerts-dashboard\",topic=\"ory_rapid_descent\"}[5m]) * 60","legendFormat":"\ud83d\udd3b Rapid Descent","refId":"D"},
+            {"expr":"rate(cep_alerts_total{job=\"alerts-dashboard\",topic=\"ory_corridor_overload\"}[5m]) * 60","legendFormat":"\ud83d\udd35 Corridor Overload","refId":"E"}
+          ],
+          "fieldConfig": {"defaults":{"unit":"short","custom":{"lineWidth":2,"fillOpacity":10},"color":{"mode":"palette-classic"}}},
           "options": {"tooltip":{"mode":"multi"}}
         },
+
         {
-          "id": 58, "type": "timeseries", "title": "Dashboard — Latence moyenne par endpoint (s)",
-          "gridPos": {"x":12,"y":15,"w":12,"h":8},
+          "id": 62, "type": "timeseries", "title": "Alertes dans la fen\u00eatre \u2014 Live vs Simul\u00e9 (snapshot d\u00e9que)",
+          "gridPos": {"x":12,"y":25,"w":12,"h":8},
           "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
           "targets": [
-            {"expr":"rate(flask_http_request_duration_seconds_sum{job=\"alerts-dashboard\",path=\"/api/alerts\"}[1m]) / rate(flask_http_request_duration_seconds_count{job=\"alerts-dashboard\",path=\"/api/alerts\"}[1m])","legendFormat":"latence /api/alerts","refId":"A"},
-            {"expr":"rate(flask_http_request_duration_seconds_sum{job=\"alerts-dashboard\",path=\"/api/raw\"}[1m]) / rate(flask_http_request_duration_seconds_count{job=\"alerts-dashboard\",path=\"/api/raw\"}[1m])","legendFormat":"latence /api/raw","refId":"B"},
-            {"expr":"rate(flask_http_request_duration_seconds_sum{job=\"alerts-dashboard\",path=\"/api/tracker\"}[1m]) / rate(flask_http_request_duration_seconds_count{job=\"alerts-dashboard\",path=\"/api/tracker\"}[1m])","legendFormat":"latence /api/tracker","refId":"C"}
+            {"expr":"sum(cep_alerts_in_window{job=\"alerts-dashboard\",source=\"live\"})","legendFormat":"\ud83d\udce1 Live (total)","refId":"A"},
+            {"expr":"sum(cep_alerts_in_window{job=\"alerts-dashboard\",source=\"simulated\"})","legendFormat":"\ud83e\uddea Simul\u00e9 (total)","refId":"B"}
           ],
-          "fieldConfig": {"defaults":{"unit":"s","custom":{"lineWidth":2},"color":{"mode":"palette-classic"}}}
+          "fieldConfig": {"defaults":{"unit":"short","custom":{"lineWidth":2,"fillOpacity":15},"color":{"mode":"palette-classic"}}},
+          "options": {"tooltip":{"mode":"multi"}}
         },
 
-        { "id": 19, "type": "row", "title": "\ud83d\udd04 Restarts par composant", "gridPos": {"x":0,"y":23,"w":24,"h":1}, "collapsed": false },
+        { "id": 19, "type": "row", "title": "\ud83d\udd04 Restarts par composant", "gridPos": {"x":0,"y":33,"w":24,"h":1}, "collapsed": false },
 
         {
           "id": 15, "type": "timeseries", "title": "Pod Restarts par composant",
-          "gridPos": {"x":0,"y":24,"w":24,"h":8},
+          "gridPos": {"x":0,"y":34,"w":24,"h":8},
           "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
           "targets": [
             {"expr":"kube_pod_container_status_restarts_total{namespace=\"plane-track\",container=\"broker\"}","legendFormat":"broker","refId":"A"},
@@ -245,32 +264,28 @@ data:
           "fieldConfig": {"defaults":{"unit":"short","custom":{"lineWidth":2},"color":{"mode":"palette-classic"}}}
         },
 
-        { "id": 20, "type": "row", "title": "\ud83d\udcbe CPU & M\u00e9moire", "gridPos": {"x":0,"y":32,"w":24,"h":1}, "collapsed": false },
+        { "id": 20, "type": "row", "title": "\ud83d\udcbe CPU & M\u00e9moire", "gridPos": {"x":0,"y":42,"w":24,"h":1}, "collapsed": false },
 
         {
-          "id": 21, "type": "timeseries", "title": "CPU Usage — composants plane-track",
-          "gridPos": {"x":0,"y":33,"w":12,"h":8},
+          "id": 21, "type": "timeseries", "title": "CPU Usage \u2014 composants plane-track",
+          "gridPos": {"x":0,"y":43,"w":12,"h":8},
           "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
-          "targets": [
-            {"expr":"rate(container_cpu_usage_seconds_total{namespace=\"plane-track\",container!=\"\",container!=\"POD\"}[2m])","legendFormat":"{{container}}","refId":"A"}
-          ],
+          "targets": [{"expr":"rate(container_cpu_usage_seconds_total{namespace=\"plane-track\",container!=\"\",container!=\"POD\"}[2m])","legendFormat":"{{container}}","refId":"A"}],
           "fieldConfig": {"defaults":{"unit":"short","custom":{"lineWidth":1},"color":{"mode":"palette-classic"}}}
         },
         {
-          "id": 22, "type": "timeseries", "title": "M\u00e9moire RSS — composants plane-track",
-          "gridPos": {"x":12,"y":33,"w":12,"h":8},
+          "id": 22, "type": "timeseries", "title": "M\u00e9moire RSS \u2014 composants plane-track",
+          "gridPos": {"x":12,"y":43,"w":12,"h":8},
           "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
-          "targets": [
-            {"expr":"container_memory_rss{namespace=\"plane-track\",container!=\"\",container!=\"POD\"}","legendFormat":"{{container}}","refId":"A"}
-          ],
+          "targets": [{"expr":"container_memory_rss{namespace=\"plane-track\",container!=\"\",container!=\"POD\"}","legendFormat":"{{container}}","refId":"A"}],
           "fieldConfig": {"defaults":{"unit":"bytes","custom":{"lineWidth":1},"color":{"mode":"palette-classic"}}}
         },
 
-        { "id": 30, "type": "row", "title": "\ud83c\udf10 R\u00e9seau Pipeline", "gridPos": {"x":0,"y":41,"w":24,"h":1}, "collapsed": false },
+        { "id": 30, "type": "row", "title": "\ud83c\udf10 R\u00e9seau Pipeline", "gridPos": {"x":0,"y":51,"w":24,"h":1}, "collapsed": false },
 
         {
-          "id": 41, "type": "timeseries", "title": "R\u00e9seau — tous les pods plane-track (bytes/s)",
-          "gridPos": {"x":0,"y":42,"w":24,"h":8},
+          "id": 41, "type": "timeseries", "title": "R\u00e9seau \u2014 tous les pods plane-track (bytes/s)",
+          "gridPos": {"x":0,"y":52,"w":24,"h":8},
           "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
           "targets": [
             {"expr":"sum by (pod) (rate(container_network_receive_bytes_total{namespace=\"plane-track\"}[1m]))","legendFormat":"rx \u2193 {{pod}}","refId":"A"},

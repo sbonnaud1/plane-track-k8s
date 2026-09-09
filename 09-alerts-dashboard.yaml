@@ -51,10 +51,33 @@ data:
     # ── Prometheus metrics (/metrics endpoint) ────────────────────────────────
     try:
         from prometheus_flask_exporter import PrometheusMetrics
+        from prometheus_client import Counter, Gauge
         _prom = PrometheusMetrics(app, path="/metrics", default_labels={"app": "alerts-dashboard"})
         _prom.info("alerts_dashboard_info", "Alerts dashboard metadata", version="1.0")
-    except ImportError:
-        pass  # prometheus-flask-exporter not installed — /metrics unavailable
+        # Per-topic, per-source counters — incremented by _consume() on every accepted alert
+        _cep_alerts_total = Counter(
+            "cep_alerts_total",
+            "Total CEP alerts accepted (after dedup)",
+            ["topic", "source"]   # source = "live" | "simulated"
+        )
+        _cep_alerts_in_window = Gauge(
+            "cep_alerts_in_window",
+            "Current number of CEP alerts held in the dashboard deque",
+            ["topic", "source"]
+        )
+        _adsb_raw_vectors = Gauge(
+            "adsb_raw_vectors_total",
+            "Number of raw ADS-B vectors currently in memory"
+        )
+    except (ImportError, Exception):
+        # prometheus_client not available — define no-op stubs so _consume() still works
+        class _NoOp:
+            def labels(self, **_): return self
+            def inc(self): pass
+            def set(self, _): pass
+        _cep_alerts_total    = _NoOp()
+        _cep_alerts_in_window = _NoOp()
+        _adsb_raw_vectors    = _NoOp()
 
     _alerts: deque = deque(maxlen=MAX_ALERTS)
     _raw:    deque = deque(maxlen=MAX_RAW)   # latest raw ADS-B vectors
@@ -150,12 +173,37 @@ data:
                         _seq += 1
                         alert["_id"] = _seq
                         _alerts.appendleft(alert)
+                        # ── Prometheus counters ──────────────────────────────
+                        _src = "simulated" if alert["_simulated"] else "live"
+                        _cep_alerts_total.labels(topic=msg.topic, source=_src).inc()
             except Exception as exc:
                 print(f"[dashboard] Consumer error: {exc}", flush=True)
                 time.sleep(2)
 
     _t = threading.Thread(target=_consume, daemon=True)
     _t.start()
+
+    # ── Gauge updater — snapshot deque counts into Prometheus every 10 s ─────
+    def _update_gauges():
+        _TOPICS = ["ory_missed_approach", "ory_twin_landing",
+                   "ory_repeated_goaround", "ory_rapid_descent", "ory_corridor_overload"]
+        while True:
+            time.sleep(10)
+            try:
+                with _lock:
+                    alerts_snap = list(_alerts)
+                    raw_len     = len(_raw)
+                for topic in _TOPICS:
+                    for src in ("live", "simulated"):
+                        count = sum(1 for a in alerts_snap
+                                    if a.get("_topic") == topic
+                                    and (("simulated" if a.get("_simulated") else "live") == src))
+                        _cep_alerts_in_window.labels(topic=topic, source=src).set(count)
+                _adsb_raw_vectors.set(raw_len)
+            except Exception:
+                pass
+
+    threading.Thread(target=_update_gauges, daemon=True).start()
 
     # ── Raw ADS-B consumer (adsb_raw → _raw deque) ───────────────────────────
     def _consume_raw():
@@ -2706,6 +2754,8 @@ kind: Service
 metadata:
   name: alerts-dashboard
   namespace: plane-track
+  labels:
+    app: alerts-dashboard
 spec:
   selector:
     app: alerts-dashboard
@@ -2734,17 +2784,34 @@ spec:
 
 
 ---
+# RoleBinding — allows OpenShift user-workload Prometheus to scrape plane-track pods
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: prometheus-user-workload-scrape
+  namespace: plane-track
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: view
+subjects:
+  - kind: ServiceAccount
+    name: prometheus-user-workload
+    namespace: openshift-user-workload-monitoring
+---
 # ServiceMonitor — scrapes /metrics on alerts-dashboard (prometheus-flask-exporter)
-# Picked up by OpenShift user-workload-monitoring Prometheus.
+# Must live in test-app so the user-workload Prometheus picks it up.
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
   name: alerts-dashboard
-  namespace: plane-track
+  namespace: test-app
   labels:
     app: alerts-dashboard
-    app.kubernetes.io/part-of: plane-track
 spec:
+  namespaceSelector:
+    matchNames:
+      - plane-track
   selector:
     matchLabels:
       app: alerts-dashboard
@@ -2752,3 +2819,4 @@ spec:
     - port: http
       path: /metrics
       interval: 15s
+      scheme: http
