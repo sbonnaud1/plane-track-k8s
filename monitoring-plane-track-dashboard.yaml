@@ -141,8 +141,8 @@ data:
           "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
           "targets": [
             {"expr":"sum(cep_alerts_total{job=\"alerts-dashboard\",topic=\"ory_missed_approach\"}) or vector(0)","legendFormat":"Total","refId":"A"},
-            {"expr":"cep_alerts_in_window{job=\"alerts-dashboard\",topic=\"ory_missed_approach\",source=\"live\"} or vector(0)","legendFormat":"Live","refId":"B"},
-            {"expr":"cep_alerts_in_window{job=\"alerts-dashboard\",topic=\"ory_missed_approach\",source=\"simulated\"} or vector(0)","legendFormat":"Sim","refId":"C"}
+            {"expr":"sum(cep_alerts_in_window{job=\"alerts-dashboard\",topic=\"ory_missed_approach\",source=\"live\"}) or vector(0)","legendFormat":"Live","refId":"B"},
+            {"expr":"sum(cep_alerts_in_window{job=\"alerts-dashboard\",topic=\"ory_missed_approach\",source=\"simulated\"}) or vector(0)","legendFormat":"Sim","refId":"C"}
           ],
           "options": {"colorMode":"background","graphMode":"area","reduceOptions":{"calcs":["lastNotNull"]}},
           "fieldConfig": {"defaults":{"thresholds":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"orange","value":3},{"color":"red","value":10}]},"unit":"short"}}
@@ -153,7 +153,7 @@ data:
           "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
           "targets": [
             {"expr":"sum(cep_alerts_total{job=\"alerts-dashboard\",topic=\"ory_twin_landing\"}) or vector(0)","legendFormat":"Total","refId":"A"},
-            {"expr":"cep_alerts_in_window{job=\"alerts-dashboard\",topic=\"ory_twin_landing\",source=\"simulated\"} or vector(0)","legendFormat":"Sim","refId":"B"}
+            {"expr":"sum(cep_alerts_in_window{job=\"alerts-dashboard\",topic=\"ory_twin_landing\",source=\"simulated\"}) or vector(0)","legendFormat":"Sim","refId":"B"}
           ],
           "options": {"colorMode":"background","graphMode":"area","reduceOptions":{"calcs":["lastNotNull"]}},
           "fieldConfig": {"defaults":{"thresholds":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"orange","value":2},{"color":"red","value":8}]},"unit":"short"}}
@@ -164,8 +164,8 @@ data:
           "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
           "targets": [
             {"expr":"sum(cep_alerts_total{job=\"alerts-dashboard\",topic=\"ory_repeated_goaround\"}) or vector(0)","legendFormat":"Total","refId":"A"},
-            {"expr":"cep_alerts_in_window{job=\"alerts-dashboard\",topic=\"ory_repeated_goaround\",source=\"live\"} or vector(0)","legendFormat":"Live","refId":"B"},
-            {"expr":"cep_alerts_in_window{job=\"alerts-dashboard\",topic=\"ory_repeated_goaround\",source=\"simulated\"} or vector(0)","legendFormat":"Sim","refId":"C"}
+            {"expr":"sum(cep_alerts_in_window{job=\"alerts-dashboard\",topic=\"ory_repeated_goaround\",source=\"live\"}) or vector(0)","legendFormat":"Live","refId":"B"},
+            {"expr":"sum(cep_alerts_in_window{job=\"alerts-dashboard\",topic=\"ory_repeated_goaround\",source=\"simulated\"}) or vector(0)","legendFormat":"Sim","refId":"C"}
           ],
           "options": {"colorMode":"background","graphMode":"area","reduceOptions":{"calcs":["lastNotNull"]}},
           "fieldConfig": {"defaults":{"thresholds":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"orange","value":1},{"color":"red","value":3}]},"unit":"short"}}
@@ -176,8 +176,8 @@ data:
           "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
           "targets": [
             {"expr":"sum(cep_alerts_total{job=\"alerts-dashboard\",topic=\"ory_rapid_descent\"}) or vector(0)","legendFormat":"Total","refId":"A"},
-            {"expr":"cep_alerts_in_window{job=\"alerts-dashboard\",topic=\"ory_rapid_descent\",source=\"live\"} or vector(0)","legendFormat":"Live","refId":"B"},
-            {"expr":"cep_alerts_in_window{job=\"alerts-dashboard\",topic=\"ory_rapid_descent\",source=\"simulated\"} or vector(0)","legendFormat":"Sim","refId":"C"}
+            {"expr":"sum(cep_alerts_in_window{job=\"alerts-dashboard\",topic=\"ory_rapid_descent\",source=\"live\"}) or vector(0)","legendFormat":"Live","refId":"B"},
+            {"expr":"sum(cep_alerts_in_window{job=\"alerts-dashboard\",topic=\"ory_rapid_descent\",source=\"simulated\"}) or vector(0)","legendFormat":"Sim","refId":"C"}
           ],
           "options": {"colorMode":"background","graphMode":"area","reduceOptions":{"calcs":["lastNotNull"]}},
           "fieldConfig": {"defaults":{"thresholds":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"orange","value":1},{"color":"red","value":3}]},"unit":"short"}}
@@ -188,8 +188,8 @@ data:
           "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
           "targets": [
             {"expr":"sum(cep_alerts_total{job=\"alerts-dashboard\",topic=\"ory_corridor_overload\"}) or vector(0)","legendFormat":"Total","refId":"A"},
-            {"expr":"cep_alerts_in_window{job=\"alerts-dashboard\",topic=\"ory_corridor_overload\",source=\"live\"} or vector(0)","legendFormat":"Live","refId":"B"},
-            {"expr":"cep_alerts_in_window{job=\"alerts-dashboard\",topic=\"ory_corridor_overload\",source=\"simulated\"} or vector(0)","legendFormat":"Sim","refId":"C"}
+            {"expr":"sum(cep_alerts_in_window{job=\"alerts-dashboard\",topic=\"ory_corridor_overload\",source=\"live\"}) or vector(0)","legendFormat":"Live","refId":"B"},
+            {"expr":"sum(cep_alerts_in_window{job=\"alerts-dashboard\",topic=\"ory_corridor_overload\",source=\"simulated\"}) or vector(0)","legendFormat":"Sim","refId":"C"}
           ],
           "options": {"colorMode":"background","graphMode":"area","reduceOptions":{"calcs":["lastNotNull"]}},
           "fieldConfig": {"defaults":{"thresholds":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"orange","value":1},{"color":"red","value":3}]},"unit":"short"}}
