@@ -763,6 +763,16 @@ data:
         .tracker-stat.green .tv { color:#3fb950; }
         .tracker-stat.yellow .tv { color:#d29922; }
         .tracker-stat.red .tv { color:#f85149; }
+        .tracker-filters { display:flex; gap:8px; align-items:center; padding:6px 12px;
+                           background:#0d1117; border-bottom:1px solid #21262d; flex-wrap:wrap; flex-shrink:0; }
+        .tracker-filters label { font-size:11px; color:#8b949e; margin-right:2px; }
+        .tracker-filters select, .tracker-filters input[type=text] {
+          background:#161b22; border:1px solid #30363d; border-radius:4px;
+          color:#e6edf3; font-size:12px; padding:3px 7px; outline:none; }
+        .tracker-filters select:focus, .tracker-filters input[type=text]:focus { border-color:#58a6ff; }
+        .tracker-filters input[type=text] { width:110px; }
+        .tracker-filters .f-sep { width:1px; background:#30363d; align-self:stretch; margin:2px 0; }
+        .tracker-filters .f-count { font-size:11px; color:#57606a; margin-left:auto; white-space:nowrap; }
         .tracker-err { background:#3d1a1a; border-bottom:1px solid #f85149;
                        padding:5px 12px; color:#f85149; font-size:11px; display:none; }
         .tracker-table-wrap { overflow-y:auto; flex:1; }
@@ -927,6 +937,22 @@ data:
             <div class="tracker-stat yellow"><div class="tv" id="tr-ground">–</div><div class="tl">On ground</div></div>
             <div class="tracker-stat red"><div class="tv" id="tr-appr">–</div><div class="tl">On approach</div></div>
             <div class="tracker-stat"><div class="tv" id="tr-updated" style="font-size:11px;padding-top:4px">–</div><div class="tl">Updated</div></div>
+          </div>
+          <div class="tracker-filters" id="tracker-filters">
+            <label for="f-status">Status</label>
+            <select id="f-status">
+              <option value="all">All</option>
+              <option value="flying">In flight</option>
+              <option value="ground">On ground</option>
+              <option value="approach">On approach</option>
+            </select>
+            <div class="f-sep"></div>
+            <label for="f-aircraft">Aircraft</label>
+            <input type="text" id="f-aircraft" placeholder="Callsign / ICAO…">
+            <div class="f-sep"></div>
+            <label for="f-country">Country</label>
+            <input type="text" id="f-country" placeholder="France…">
+            <span class="f-count" id="f-count"></span>
           </div>
           <div class="tracker-err" id="tracker-err"></div>
           <div class="tracker-table-wrap">
@@ -2342,6 +2368,31 @@ data:
           var _trackerPollTimer  = null;
           var _trackerReady      = false;
           var _trackerSelRow     = null;
+          var _trackerAllStates  = [];     // full unfiltered states array
+          var _trackerFilters    = { status: 'all', aircraft: '', country: '' };
+
+          /* ── Filter helpers ── */
+          function _matchFilters(s) {
+            var onGnd  = s[8] !== false;
+            var isAppr = !onGnd && s[7] != null && s[7] < 914;
+            var call   = ((s[1] || '') + (s[0] || '')).toUpperCase();
+            var country = (s[2] || '').toUpperCase();
+            var f = _trackerFilters;
+            if (f.status === 'flying'   && (onGnd || isAppr)) return false;
+            if (f.status === 'ground'   && !onGnd)            return false;
+            if (f.status === 'approach' && !isAppr)           return false;
+            if (f.aircraft && call.indexOf(f.aircraft.toUpperCase()) === -1) return false;
+            if (f.country  && country.indexOf(f.country.toUpperCase()) === -1) return false;
+            return true;
+          }
+
+          function _applyFilters() {
+            var filtered = _trackerAllStates.filter(_matchFilters);
+            _updateTable(filtered);
+            _updateMap(filtered);
+            var fc = document.getElementById('f-count');
+            if (fc) fc.textContent = filtered.length + ' / ' + _trackerAllStates.length + ' aircraft';
+          }
 
           /* ── Lazy-load Leaflet CSS ── */
           function _injectLeafletCSS() {
@@ -2551,9 +2602,9 @@ data:
                   if (errEl) errEl.style.display = 'none';
                 }
                 var states = data.states || [];
-                _updateMap(states);
-                _updateTable(states);
+                _trackerAllStates = states;
                 _updateStats(states, data.fetched_at);
+                _applyFilters();
                 var sb = document.getElementById('tracker-statusbar');
                 if (sb) sb.textContent = 'ORY box (48.10–49.15°N / 1.90–2.90°E) · ' + states.length + ' aircraft · updated ' + (data.fetched_at || '–') + ' · next in ~60 s';
               })
@@ -2595,6 +2646,7 @@ data:
                   '<span>Map unavailable (Leaflet could not be loaded).</span>' +
                   '<span style="font-size:11px;color:#57606a">The flight table is still live — data refreshes every 60 s.</span>' +
                   '</div>';
+                _bindFilterListeners();
                 _pollTracker();
                 _trackerPollTimer = setInterval(_pollTracker, 60000);
                 return;
@@ -2633,8 +2685,28 @@ data:
               })
             }).addTo(_trackerMap).bindPopup('<strong style="color:#d29922">Paris-Orly Airport (ORY)</strong><br><span style="color:#8b949e;font-size:11px;">IATA: ORY · ICAO: LFPO</span>');
 
+            _bindFilterListeners();
             _pollTracker();
             _trackerPollTimer = setInterval(_pollTracker, 60000);
+          }
+
+          /* ── Bind filter controls (called once after init) ── */
+          function _bindFilterListeners() {
+            var fStatus   = document.getElementById('f-status');
+            var fAircraft = document.getElementById('f-aircraft');
+            var fCountry  = document.getElementById('f-country');
+            if (fStatus) fStatus.addEventListener('change', function() {
+              _trackerFilters.status = this.value;
+              _applyFilters();
+            });
+            if (fAircraft) fAircraft.addEventListener('input', function() {
+              _trackerFilters.aircraft = this.value.trim();
+              _applyFilters();
+            });
+            if (fCountry) fCountry.addEventListener('input', function() {
+              _trackerFilters.country = this.value.trim();
+              _applyFilters();
+            });
           }
 
           /* ── If Leaflet was already loaded (e.g. page refresh), auto-detect ── */
