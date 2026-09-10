@@ -812,8 +812,8 @@ data:
       <!-- Tab bar -->
       <div class="tabbar">
         <div class="tab active" id="tab-btn-sim">🧪 Simulated<span class="tab-badge empty" id="tab-badge-sim">0</span></div>
-        <div class="tab"        id="tab-btn-live">📡 Live — OpenSky ADS-B<span class="tab-badge empty" id="tab-badge-live">0</span></div>
         <div class="tab"        id="tab-btn-events">🧪 Simulated Flight Events</div>
+        <div class="tab"        id="tab-btn-live">📡 Live — OpenSky ADS-B<span class="tab-badge empty" id="tab-badge-live">0</span></div>
         <div class="tab"        id="tab-btn-tracker">✈ Aviation Flight Tracker</div>
         <div class="tab"        id="tab-btn-about">📖 About &amp; Architecture</div>
       </div>
