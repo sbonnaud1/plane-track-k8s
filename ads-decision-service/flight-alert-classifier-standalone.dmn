@@ -1,0 +1,321 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  flight-alert-classifier — STANDALONE single-file DMN
+  =====================================================
+  Self-contained version for manual upload into IBM ADS Decision Center.
+  No external imports — all type definitions and decision tables are inline.
+
+  Operation exposed by ADS after deployment:
+    POST .../decisions/<id>/operations/classifyFlightAlert/execute
+
+  Request:
+    { "input": { "alert": { "alert_type": "RAPID_DESCENT", "icao24": "...", ... } } }
+
+  Response:
+    { "output": { "severity": "CRITICAL", "recommended_action": "EMERGENCY",
+                  "escalation_required": true, "rationale": "...", "display_color": "red" } }
+-->
+<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/"
+             xmlns:dmndi="https://www.omg.org/spec/DMN/20191111/DMNDI/"
+             xmlns:dc="http://www.omg.org/spec/DMN/20180521/DC/"
+             xmlns:di="http://www.omg.org/spec/DMN/20180521/DI/"
+             id="FlightAlertClassifier"
+             name="flight-alert-classifier"
+             namespace="https://ibm.com/planetrack">
+
+  <!-- ═══════════════════════════════════════════════════════════════════════
+       TYPE DEFINITIONS
+       ═══════════════════════════════════════════════════════════════════════ -->
+
+  <!-- AlertInput — one CEP alert from the Flink/Kafka pipeline -->
+  <itemDefinition id="AlertInputType" name="AlertInput" isCollection="false">
+    <itemComponent id="comp_alert_type"       name="alert_type"       isCollection="false"><typeRef>string</typeRef>
+      <allowedValues><text>"MISSED_APPROACH","TWIN_LANDING","RAPID_DESCENT","CORRIDOR_OVERLOAD","REPEATED_GOAROUND"</text></allowedValues>
+    </itemComponent>
+    <itemComponent id="comp_icao24"           name="icao24"           isCollection="false"><typeRef>string</typeRef></itemComponent>
+    <itemComponent id="comp_callsign"         name="callsign"         isCollection="false"><typeRef>string</typeRef></itemComponent>
+    <itemComponent id="comp_baro_altitude"    name="baro_altitude"    isCollection="false"><typeRef>number</typeRef></itemComponent>
+    <itemComponent id="comp_vertical_rate"    name="vertical_rate"    isCollection="false"><typeRef>number</typeRef></itemComponent>
+    <itemComponent id="comp_aircraft_count"   name="aircraft_count"   isCollection="false"><typeRef>number</typeRef></itemComponent>
+    <itemComponent id="comp_alt_separation_m" name="alt_separation_m" isCollection="false"><typeRef>number</typeRef></itemComponent>
+    <itemComponent id="comp_goaround_count"   name="goaround_count"   isCollection="false"><typeRef>number</typeRef></itemComponent>
+    <itemComponent id="comp_detection_ts"     name="detection_ts"     isCollection="false"><typeRef>string</typeRef></itemComponent>
+  </itemDefinition>
+
+  <!-- AlertDecision — enrichment output returned to the Flask dashboard -->
+  <itemDefinition id="AlertDecisionType" name="AlertDecision" isCollection="false">
+    <itemComponent id="comp_severity"            name="severity"            isCollection="false"><typeRef>string</typeRef>
+      <allowedValues><text>"CRITICAL","HIGH","MEDIUM","LOW","INFO"</text></allowedValues>
+    </itemComponent>
+    <itemComponent id="comp_recommended_action"  name="recommended_action"  isCollection="false"><typeRef>string</typeRef>
+      <allowedValues><text>"EMERGENCY","GROUND_STOP","NOTIFY_ATC","MONITOR","ROUTINE_LOG"</text></allowedValues>
+    </itemComponent>
+    <itemComponent id="comp_escalation_required" name="escalation_required" isCollection="false"><typeRef>boolean</typeRef></itemComponent>
+    <itemComponent id="comp_rationale"           name="rationale"           isCollection="false"><typeRef>string</typeRef></itemComponent>
+    <itemComponent id="comp_display_color"       name="display_color"       isCollection="false"><typeRef>string</typeRef>
+      <allowedValues><text>"red","orange","yellow","blue","grey"</text></allowedValues>
+    </itemComponent>
+  </itemDefinition>
+
+  <!-- ═══════════════════════════════════════════════════════════════════════
+       INPUT DATA
+       ═══════════════════════════════════════════════════════════════════════ -->
+
+  <inputData id="AlertInputData" name="alert">
+    <variable id="AlertInputData_var" name="alert" typeRef="AlertInput"/>
+  </inputData>
+
+  <!-- ═══════════════════════════════════════════════════════════════════════
+       DECISION 1 — Determine Severity (PRIORITY hit policy)
+       Maps CEP alert fields → severity level.
+       PRIORITY means the first matching rule (top-to-bottom) wins.
+       ═══════════════════════════════════════════════════════════════════════ -->
+
+  <decision id="DetermineSeverity" name="Determine Severity">
+    <variable id="DetermineSeverity_var" name="Determine Severity" typeRef="string"/>
+    <informationRequirement id="ir_input_to_severity">
+      <requiredInput href="#AlertInputData"/>
+    </informationRequirement>
+
+    <decisionTable id="SeverityTable" hitPolicy="PRIORITY">
+
+      <input id="sev_in_type"   label="Alert Type">
+        <inputExpression typeRef="string"><text>alert.alert_type</text></inputExpression>
+        <inputValues><text>"MISSED_APPROACH","TWIN_LANDING","RAPID_DESCENT","CORRIDOR_OVERLOAD","REPEATED_GOAROUND"</text></inputValues>
+      </input>
+      <input id="sev_in_vrate"  label="Vertical Rate (m/s)">
+        <inputExpression typeRef="number"><text>alert.vertical_rate</text></inputExpression>
+      </input>
+      <input id="sev_in_alt"    label="Baro Altitude (m)">
+        <inputExpression typeRef="number"><text>alert.baro_altitude</text></inputExpression>
+      </input>
+      <input id="sev_in_sep"    label="Alt Separation (m)">
+        <inputExpression typeRef="number"><text>alert.alt_separation_m</text></inputExpression>
+      </input>
+      <input id="sev_in_count"  label="Aircraft Count">
+        <inputExpression typeRef="number"><text>alert.aircraft_count</text></inputExpression>
+      </input>
+      <input id="sev_in_ga"     label="Go-Around Count">
+        <inputExpression typeRef="number"><text>alert.goaround_count</text></inputExpression>
+      </input>
+
+      <output id="sev_out" name="severity" typeRef="string">
+        <outputValues><text>"CRITICAL","HIGH","MEDIUM","LOW","INFO"</text></outputValues>
+      </output>
+
+      <!-- RAPID_DESCENT rules -->
+      <rule id="SR_R01"><description>Extreme descent: vertical rate below -25 m/s</description>
+        <inputEntry><text>"RAPID_DESCENT"</text></inputEntry><inputEntry><text>&lt; -25</text></inputEntry>
+        <inputEntry><text>-</text></inputEntry><inputEntry><text>-</text></inputEntry>
+        <inputEntry><text>-</text></inputEntry><inputEntry><text>-</text></inputEntry>
+        <outputEntry><text>"CRITICAL"</text></outputEntry></rule>
+
+      <rule id="SR_R02"><description>Severe descent: between -18 and -25 m/s</description>
+        <inputEntry><text>"RAPID_DESCENT"</text></inputEntry><inputEntry><text>[-25..-18]</text></inputEntry>
+        <inputEntry><text>-</text></inputEntry><inputEntry><text>-</text></inputEntry>
+        <inputEntry><text>-</text></inputEntry><inputEntry><text>-</text></inputEntry>
+        <outputEntry><text>"HIGH"</text></outputEntry></rule>
+
+      <!-- TWIN_LANDING rules -->
+      <rule id="SR_R03"><description>Twin landing: separation below 100 m</description>
+        <inputEntry><text>"TWIN_LANDING"</text></inputEntry><inputEntry><text>-</text></inputEntry>
+        <inputEntry><text>-</text></inputEntry><inputEntry><text>&lt; 100</text></inputEntry>
+        <inputEntry><text>-</text></inputEntry><inputEntry><text>-</text></inputEntry>
+        <outputEntry><text>"CRITICAL"</text></outputEntry></rule>
+
+      <rule id="SR_R04"><description>Twin landing: separation 100-200 m</description>
+        <inputEntry><text>"TWIN_LANDING"</text></inputEntry><inputEntry><text>-</text></inputEntry>
+        <inputEntry><text>-</text></inputEntry><inputEntry><text>[100..200)</text></inputEntry>
+        <inputEntry><text>-</text></inputEntry><inputEntry><text>-</text></inputEntry>
+        <outputEntry><text>"HIGH"</text></outputEntry></rule>
+
+      <rule id="SR_R05"><description>Twin landing: separation >= 200 m</description>
+        <inputEntry><text>"TWIN_LANDING"</text></inputEntry><inputEntry><text>-</text></inputEntry>
+        <inputEntry><text>-</text></inputEntry><inputEntry><text>&gt;= 200</text></inputEntry>
+        <inputEntry><text>-</text></inputEntry><inputEntry><text>-</text></inputEntry>
+        <outputEntry><text>"MEDIUM"</text></outputEntry></rule>
+
+      <!-- CORRIDOR_OVERLOAD rules -->
+      <rule id="SR_R06"><description>Corridor overload: 5+ aircraft</description>
+        <inputEntry><text>"CORRIDOR_OVERLOAD"</text></inputEntry><inputEntry><text>-</text></inputEntry>
+        <inputEntry><text>-</text></inputEntry><inputEntry><text>-</text></inputEntry>
+        <inputEntry><text>&gt;= 5</text></inputEntry><inputEntry><text>-</text></inputEntry>
+        <outputEntry><text>"CRITICAL"</text></outputEntry></rule>
+
+      <rule id="SR_R07"><description>Corridor overload: 4 aircraft</description>
+        <inputEntry><text>"CORRIDOR_OVERLOAD"</text></inputEntry><inputEntry><text>-</text></inputEntry>
+        <inputEntry><text>-</text></inputEntry><inputEntry><text>-</text></inputEntry>
+        <inputEntry><text>4</text></inputEntry><inputEntry><text>-</text></inputEntry>
+        <outputEntry><text>"HIGH"</text></outputEntry></rule>
+
+      <rule id="SR_R08"><description>Corridor overload: 3 aircraft</description>
+        <inputEntry><text>"CORRIDOR_OVERLOAD"</text></inputEntry><inputEntry><text>-</text></inputEntry>
+        <inputEntry><text>-</text></inputEntry><inputEntry><text>-</text></inputEntry>
+        <inputEntry><text>3</text></inputEntry><inputEntry><text>-</text></inputEntry>
+        <outputEntry><text>"MEDIUM"</text></outputEntry></rule>
+
+      <!-- REPEATED_GOAROUND rules -->
+      <rule id="SR_R09"><description>Repeated go-around: 3+ times</description>
+        <inputEntry><text>"REPEATED_GOAROUND"</text></inputEntry><inputEntry><text>-</text></inputEntry>
+        <inputEntry><text>-</text></inputEntry><inputEntry><text>-</text></inputEntry>
+        <inputEntry><text>-</text></inputEntry><inputEntry><text>&gt;= 3</text></inputEntry>
+        <outputEntry><text>"CRITICAL"</text></outputEntry></rule>
+
+      <rule id="SR_R10"><description>Repeated go-around: 2 times</description>
+        <inputEntry><text>"REPEATED_GOAROUND"</text></inputEntry><inputEntry><text>-</text></inputEntry>
+        <inputEntry><text>-</text></inputEntry><inputEntry><text>-</text></inputEntry>
+        <inputEntry><text>-</text></inputEntry><inputEntry><text>2</text></inputEntry>
+        <outputEntry><text>"HIGH"</text></outputEntry></rule>
+
+      <!-- MISSED_APPROACH rules -->
+      <rule id="SR_R11"><description>Missed approach: go-around below 250 m</description>
+        <inputEntry><text>"MISSED_APPROACH"</text></inputEntry><inputEntry><text>-</text></inputEntry>
+        <inputEntry><text>&lt; 250</text></inputEntry><inputEntry><text>-</text></inputEntry>
+        <inputEntry><text>-</text></inputEntry><inputEntry><text>-</text></inputEntry>
+        <outputEntry><text>"HIGH"</text></outputEntry></rule>
+
+      <rule id="SR_R12"><description>Missed approach: standard go-around</description>
+        <inputEntry><text>"MISSED_APPROACH"</text></inputEntry><inputEntry><text>-</text></inputEntry>
+        <inputEntry><text>&gt;= 250</text></inputEntry><inputEntry><text>-</text></inputEntry>
+        <inputEntry><text>-</text></inputEntry><inputEntry><text>-</text></inputEntry>
+        <outputEntry><text>"MEDIUM"</text></outputEntry></rule>
+
+      <!-- Fallback -->
+      <rule id="SR_R13"><description>Default: low severity for any other case</description>
+        <inputEntry><text>-</text></inputEntry><inputEntry><text>-</text></inputEntry>
+        <inputEntry><text>-</text></inputEntry><inputEntry><text>-</text></inputEntry>
+        <inputEntry><text>-</text></inputEntry><inputEntry><text>-</text></inputEntry>
+        <outputEntry><text>"LOW"</text></outputEntry></rule>
+
+    </decisionTable>
+  </decision>
+
+  <!-- ═══════════════════════════════════════════════════════════════════════
+       DECISION 2 — Classify Flight Alert (UNIQUE hit policy)
+       Top-level output: maps severity + alert_type → full AlertDecision.
+       UNIQUE means exactly one rule must match.
+       ═══════════════════════════════════════════════════════════════════════ -->
+
+  <decision id="classifyFlightAlert" name="classifyFlightAlert">
+    <variable id="classifyFlightAlert_var" name="classifyFlightAlert" typeRef="AlertDecision"/>
+    <informationRequirement id="ir_severity_to_classify">
+      <requiredDecision href="#DetermineSeverity"/>
+    </informationRequirement>
+    <informationRequirement id="ir_input_to_classify">
+      <requiredInput href="#AlertInputData"/>
+    </informationRequirement>
+
+    <decisionTable id="ClassifyTable" hitPolicy="UNIQUE">
+
+      <input id="cls_in_severity" label="Severity">
+        <inputExpression typeRef="string"><text>Determine Severity</text></inputExpression>
+        <inputValues><text>"LOW","MEDIUM","HIGH","CRITICAL"</text></inputValues>
+      </input>
+      <input id="cls_in_type" label="Alert Type">
+        <inputExpression typeRef="string"><text>alert.alert_type</text></inputExpression>
+        <inputValues><text>"MISSED_APPROACH","TWIN_LANDING","RAPID_DESCENT","CORRIDOR_OVERLOAD","REPEATED_GOAROUND"</text></inputValues>
+      </input>
+
+      <output id="cls_out_action"    name="recommended_action"  typeRef="string">
+        <outputValues><text>"MONITOR","NOTIFY_ATC","GROUND_STOP","EMERGENCY","ROUTINE_LOG"</text></outputValues>
+      </output>
+      <output id="cls_out_esc"       name="escalation_required" typeRef="boolean"/>
+      <output id="cls_out_color"     name="display_color"       typeRef="string">
+        <outputValues><text>"grey","blue","yellow","orange","red"</text></outputValues>
+      </output>
+      <output id="cls_out_rationale" name="rationale"           typeRef="string"/>
+
+      <!-- LOW -->
+      <rule id="CLS_A01"><inputEntry><text>"LOW"</text></inputEntry><inputEntry><text>-</text></inputEntry>
+        <outputEntry><text>"MONITOR"</text></outputEntry><outputEntry><text>false</text></outputEntry>
+        <outputEntry><text>"blue"</text></outputEntry><outputEntry><text>"Informational alert — no action required"</text></outputEntry></rule>
+
+      <!-- MEDIUM -->
+      <rule id="CLS_A02"><inputEntry><text>"MEDIUM"</text></inputEntry><inputEntry><text>"MISSED_APPROACH"</text></inputEntry>
+        <outputEntry><text>"MONITOR"</text></outputEntry><outputEntry><text>false</text></outputEntry>
+        <outputEntry><text>"yellow"</text></outputEntry><outputEntry><text>"Standard missed approach — aircraft on published go-around procedure"</text></outputEntry></rule>
+
+      <rule id="CLS_A03"><inputEntry><text>"MEDIUM"</text></inputEntry><inputEntry><text>"CORRIDOR_OVERLOAD"</text></inputEntry>
+        <outputEntry><text>"NOTIFY_ATC"</text></outputEntry><outputEntry><text>false</text></outputEntry>
+        <outputEntry><text>"yellow"</text></outputEntry><outputEntry><text>"3 aircraft in corridor — notify controller to increase spacing"</text></outputEntry></rule>
+
+      <rule id="CLS_A04"><inputEntry><text>"MEDIUM"</text></inputEntry><inputEntry><text>"TWIN_LANDING"</text></inputEntry>
+        <outputEntry><text>"NOTIFY_ATC"</text></outputEntry><outputEntry><text>false</text></outputEntry>
+        <outputEntry><text>"yellow"</text></outputEntry><outputEntry><text>"Separation violation — vertical clearance maintained but longitudinal separation insufficient"</text></outputEntry></rule>
+
+      <rule id="CLS_A05"><inputEntry><text>"MEDIUM"</text></inputEntry><inputEntry><text>-</text></inputEntry>
+        <outputEntry><text>"NOTIFY_ATC"</text></outputEntry><outputEntry><text>false</text></outputEntry>
+        <outputEntry><text>"yellow"</text></outputEntry><outputEntry><text>"Medium severity alert — ATC notification recommended"</text></outputEntry></rule>
+
+      <!-- HIGH -->
+      <rule id="CLS_A06"><inputEntry><text>"HIGH"</text></inputEntry><inputEntry><text>"RAPID_DESCENT"</text></inputEntry>
+        <outputEntry><text>"NOTIFY_ATC"</text></outputEntry><outputEntry><text>true</text></outputEntry>
+        <outputEntry><text>"orange"</text></outputEntry><outputEntry><text>"Rapid descent at -18 m/s or below — ATC immediate notification required"</text></outputEntry></rule>
+
+      <rule id="CLS_A07"><inputEntry><text>"HIGH"</text></inputEntry><inputEntry><text>"TWIN_LANDING"</text></inputEntry>
+        <outputEntry><text>"NOTIFY_ATC"</text></outputEntry><outputEntry><text>true</text></outputEntry>
+        <outputEntry><text>"orange"</text></outputEntry><outputEntry><text>"Marginal separation — notify ATC and issue go-around to trailing aircraft"</text></outputEntry></rule>
+
+      <rule id="CLS_A08"><inputEntry><text>"HIGH"</text></inputEntry><inputEntry><text>"CORRIDOR_OVERLOAD"</text></inputEntry>
+        <outputEntry><text>"NOTIFY_ATC"</text></outputEntry><outputEntry><text>true</text></outputEntry>
+        <outputEntry><text>"orange"</text></outputEntry><outputEntry><text>"4 aircraft in corridor — high ATC workload, consider holding stack"</text></outputEntry></rule>
+
+      <rule id="CLS_A09"><inputEntry><text>"HIGH"</text></inputEntry><inputEntry><text>"REPEATED_GOAROUND"</text></inputEntry>
+        <outputEntry><text>"NOTIFY_ATC"</text></outputEntry><outputEntry><text>true</text></outputEntry>
+        <outputEntry><text>"orange"</text></outputEntry><outputEntry><text>"2 go-arounds in 30 min — check aircraft status with crew, possible technical issue"</text></outputEntry></rule>
+
+      <rule id="CLS_A10"><inputEntry><text>"HIGH"</text></inputEntry><inputEntry><text>"MISSED_APPROACH"</text></inputEntry>
+        <outputEntry><text>"NOTIFY_ATC"</text></outputEntry><outputEntry><text>true</text></outputEntry>
+        <outputEntry><text>"orange"</text></outputEntry><outputEntry><text>"Go-around below 250 m — dangerously low, immediate ATC coordination required"</text></outputEntry></rule>
+
+      <!-- CRITICAL -->
+      <rule id="CLS_A11"><inputEntry><text>"CRITICAL"</text></inputEntry><inputEntry><text>"RAPID_DESCENT"</text></inputEntry>
+        <outputEntry><text>"EMERGENCY"</text></outputEntry><outputEntry><text>true</text></outputEntry>
+        <outputEntry><text>"red"</text></outputEntry><outputEntry><text>"Extreme descent rate below 500 m — activate emergency services (fire, medical)"</text></outputEntry></rule>
+
+      <rule id="CLS_A12"><inputEntry><text>"CRITICAL"</text></inputEntry><inputEntry><text>"TWIN_LANDING"</text></inputEntry>
+        <outputEntry><text>"EMERGENCY"</text></outputEntry><outputEntry><text>true</text></outputEntry>
+        <outputEntry><text>"red"</text></outputEntry><outputEntry><text>"Near-collision: less than 100 m vertical separation — declare emergency, divert trailing aircraft"</text></outputEntry></rule>
+
+      <rule id="CLS_A13"><inputEntry><text>"CRITICAL"</text></inputEntry><inputEntry><text>"CORRIDOR_OVERLOAD"</text></inputEntry>
+        <outputEntry><text>"GROUND_STOP"</text></outputEntry><outputEntry><text>true</text></outputEntry>
+        <outputEntry><text>"red"</text></outputEntry><outputEntry><text>"5+ aircraft in corridor — runway system saturated, halt all departures immediately"</text></outputEntry></rule>
+
+      <rule id="CLS_A14"><inputEntry><text>"CRITICAL"</text></inputEntry><inputEntry><text>"REPEATED_GOAROUND"</text></inputEntry>
+        <outputEntry><text>"EMERGENCY"</text></outputEntry><outputEntry><text>true</text></outputEntry>
+        <outputEntry><text>"red"</text></outputEntry><outputEntry><text>"3+ go-arounds — aircraft likely in distress, activate MAYDAY protocol"</text></outputEntry></rule>
+
+      <rule id="CLS_A15"><inputEntry><text>"CRITICAL"</text></inputEntry><inputEntry><text>-</text></inputEntry>
+        <outputEntry><text>"EMERGENCY"</text></outputEntry><outputEntry><text>true</text></outputEntry>
+        <outputEntry><text>"red"</text></outputEntry><outputEntry><text>"Critical alert — immediate action required"</text></outputEntry></rule>
+
+    </decisionTable>
+  </decision>
+
+  <!-- ═══════════════════════════════════════════════════════════════════════
+       DRD VISUAL LAYOUT (DMNDI)
+       ═══════════════════════════════════════════════════════════════════════ -->
+  <dmndi:DMNDI>
+    <dmndi:DMNDiagram id="DRD_main" name="Flight Alert Classifier">
+      <dmndi:DMNShape id="shape_input"    dmnElementRef="AlertInputData">
+        <dc:Bounds x="60"  y="160" width="160" height="60"/>
+      </dmndi:DMNShape>
+      <dmndi:DMNShape id="shape_severity" dmnElementRef="DetermineSeverity">
+        <dc:Bounds x="300" y="60"  width="200" height="60"/>
+      </dmndi:DMNShape>
+      <dmndi:DMNShape id="shape_classify" dmnElementRef="classifyFlightAlert">
+        <dc:Bounds x="580" y="160" width="240" height="60"/>
+      </dmndi:DMNShape>
+      <dmndi:DMNEdge id="edge_in_sev"  dmnElementRef="ir_input_to_severity">
+        <di:waypoint x="220" y="190"/><di:waypoint x="300" y="90"/>
+      </dmndi:DMNEdge>
+      <dmndi:DMNEdge id="edge_in_cls"  dmnElementRef="ir_input_to_classify">
+        <di:waypoint x="220" y="190"/><di:waypoint x="580" y="190"/>
+      </dmndi:DMNEdge>
+      <dmndi:DMNEdge id="edge_sev_cls" dmnElementRef="ir_severity_to_classify">
+        <di:waypoint x="500" y="90"/><di:waypoint x="580" y="170"/>
+      </dmndi:DMNEdge>
+    </dmndi:DMNDiagram>
+  </dmndi:DMNDI>
+
+</definitions>

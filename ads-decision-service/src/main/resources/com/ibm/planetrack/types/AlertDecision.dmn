@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/"
+             xmlns:dmndi="https://www.omg.org/spec/DMN/20191111/DMNDI/"
+             xmlns:dc="http://www.omg.org/spec/DMN/20180521/DC/"
+             id="AlertDecision"
+             name="AlertDecision"
+             namespace="https://ibm.com/planetrack/types">
+
+  <!--
+    AlertDecision — output data type returned by the flight-alert-classifier.
+
+    severity values:
+      LOW      — informational, no immediate action needed
+      MEDIUM   — monitor closely, notify shift supervisor
+      HIGH     — notify ATC immediately
+      CRITICAL — immediate action required (ground stop / emergency protocol)
+
+    recommended_action values:
+      MONITOR       — log and watch, no human intervention needed
+      NOTIFY_ATC    — alert air traffic controller immediately
+      GROUND_STOP   — halt all departures from ORY
+      EMERGENCY     — activate emergency services (fire, medical)
+
+    escalation_required:
+      true if severity is HIGH or CRITICAL
+  -->
+
+  <itemDefinition id="AlertDecisionType" name="AlertDecision" isCollection="false">
+    <itemComponent id="severity" name="severity" isCollection="false">
+      <typeRef>string</typeRef>
+      <allowedValues id="severity_values">
+        <text>"LOW","MEDIUM","HIGH","CRITICAL"</text>
+      </allowedValues>
+    </itemComponent>
+    <itemComponent id="recommended_action" name="recommended_action" isCollection="false">
+      <typeRef>string</typeRef>
+      <allowedValues id="action_values">
+        <text>"MONITOR","NOTIFY_ATC","GROUND_STOP","EMERGENCY"</text>
+      </allowedValues>
+    </itemComponent>
+    <itemComponent id="escalation_required" name="escalation_required" isCollection="false">
+      <typeRef>boolean</typeRef>
+    </itemComponent>
+    <!-- Human-readable explanation of the decision -->
+    <itemComponent id="rationale" name="rationale" isCollection="false">
+      <typeRef>string</typeRef>
+    </itemComponent>
+    <!-- Suggested display colour for the dashboard alert card -->
+    <itemComponent id="display_color" name="display_color" isCollection="false">
+      <typeRef>string</typeRef>
+      <allowedValues id="color_values">
+        <text>"blue","yellow","orange","red"</text>
+      </allowedValues>
+    </itemComponent>
+  </itemDefinition>
+
+</definitions>

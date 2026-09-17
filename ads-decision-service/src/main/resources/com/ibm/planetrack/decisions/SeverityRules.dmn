@@ -1,0 +1,265 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/"
+             xmlns:dmndi="https://www.omg.org/spec/DMN/20191111/DMNDI/"
+             xmlns:dc="http://www.omg.org/spec/DMN/20180521/DC/"
+             id="SeverityRules"
+             name="SeverityRules"
+             namespace="https://ibm.com/planetrack/decisions">
+
+  <!--
+    ============================================================================
+    DECISION TABLE: Determine Severity
+    ============================================================================
+    Maps each CEP alert type + its key metric to a severity level.
+    Hit policy: PRIORITY — first matching rule by output priority order wins.
+    Priority order: CRITICAL > HIGH > MEDIUM > LOW
+
+    CEP mapping:
+      CEP1 MISSED_APPROACH   → key metric: baro_altitude at go-around
+      CEP2 TWIN_LANDING       → key metric: alt_separation_m between aircraft
+      CEP3 RAPID_DESCENT      → key metric: vertical_rate (m/s)
+      CEP4 CORRIDOR_OVERLOAD  → key metric: aircraft_count
+      CEP5 REPEATED_GOAROUND  → key metric: goaround_count
+    ============================================================================
+  -->
+
+  <decision id="DetermineSeverity" name="Determine Severity">
+    <variable id="DetermineSeverity_output" name="severity" typeRef="string"/>
+    <informationRequirement id="ir_alert">
+      <requiredInput href="#AlertInput"/>
+    </informationRequirement>
+
+    <decisionTable id="SeverityTable" hitPolicy="PRIORITY">
+
+      <!-- ── INPUTS ── -->
+      <input id="in_alert_type" label="Alert Type">
+        <inputExpression id="in_alert_type_expr" typeRef="string">
+          <text>alert.alert_type</text>
+        </inputExpression>
+        <inputValues id="in_alert_type_values">
+          <text>"MISSED_APPROACH","TWIN_LANDING","RAPID_DESCENT","CORRIDOR_OVERLOAD","REPEATED_GOAROUND"</text>
+        </inputValues>
+      </input>
+
+      <input id="in_vertical_rate" label="Vertical Rate (m/s)">
+        <inputExpression id="in_vrate_expr" typeRef="number">
+          <text>alert.vertical_rate</text>
+        </inputExpression>
+      </input>
+
+      <input id="in_baro_alt" label="Altitude (m)">
+        <inputExpression id="in_baro_expr" typeRef="number">
+          <text>alert.baro_altitude</text>
+        </inputExpression>
+      </input>
+
+      <input id="in_alt_sep" label="Alt Separation (m)">
+        <inputExpression id="in_sep_expr" typeRef="number">
+          <text>alert.alt_separation_m</text>
+        </inputExpression>
+      </input>
+
+      <input id="in_aircraft_count" label="Aircraft Count">
+        <inputExpression id="in_count_expr" typeRef="number">
+          <text>alert.aircraft_count</text>
+        </inputExpression>
+      </input>
+
+      <input id="in_goaround_count" label="Go-Around Count">
+        <inputExpression id="in_ga_expr" typeRef="number">
+          <text>alert.goaround_count</text>
+        </inputExpression>
+      </input>
+
+      <!-- ── OUTPUT ── -->
+      <output id="out_severity" label="Severity" name="severity" typeRef="string">
+        <outputValues id="out_severity_values">
+          <text>"CRITICAL","HIGH","MEDIUM","LOW"</text>
+        </outputValues>
+      </output>
+
+      <!-- ══════════════════════════════════════════════════════════════════
+           CEP3 — RAPID DESCENT rules
+           Threshold: -18 m/s ≈ 3 500 ft/min. Below 500 m = extreme danger.
+           ══════════════════════════════════════════════════════════════════ -->
+      <!-- R1: Rapid descent below 500 m at extreme rate → CRITICAL -->
+      <rule id="R1">
+        <inputEntry id="R1_type"><text>"RAPID_DESCENT"</text></inputEntry>
+        <inputEntry id="R1_vrate"><text>&lt; -25</text></inputEntry>
+        <inputEntry id="R1_alt"><text>&lt; 500</text></inputEntry>
+        <inputEntry id="R1_sep"><text>-</text></inputEntry>
+        <inputEntry id="R1_count"><text>-</text></inputEntry>
+        <inputEntry id="R1_ga"><text>-</text></inputEntry>
+        <outputEntry id="R1_out"><text>"CRITICAL"</text></outputEntry>
+        <annotationEntry><text>Extreme descent rate below 500 m — imminent ground impact risk</text></annotationEntry>
+      </rule>
+
+      <!-- R2: Rapid descent below 2000 m at CEP3 threshold → HIGH -->
+      <rule id="R2">
+        <inputEntry id="R2_type"><text>"RAPID_DESCENT"</text></inputEntry>
+        <inputEntry id="R2_vrate"><text>[&lt;= -18 .. -25)</text></inputEntry>
+        <inputEntry id="R2_alt"><text>-</text></inputEntry>
+        <inputEntry id="R2_sep"><text>-</text></inputEntry>
+        <inputEntry id="R2_count"><text>-</text></inputEntry>
+        <inputEntry id="R2_ga"><text>-</text></inputEntry>
+        <outputEntry id="R2_out"><text>"HIGH"</text></outputEntry>
+        <annotationEntry><text>Rapid descent at approach threshold — ATC notification required</text></annotationEntry>
+      </rule>
+
+      <!-- ══════════════════════════════════════════════════════════════════
+           CEP2 — TWIN LANDING rules
+           Longitudinal separation violation on same runway axis.
+           ══════════════════════════════════════════════════════════════════ -->
+      <!-- R3: Two aircraft with altitude separation < 100 m → CRITICAL -->
+      <rule id="R3">
+        <inputEntry id="R3_type"><text>"TWIN_LANDING"</text></inputEntry>
+        <inputEntry id="R3_vrate"><text>-</text></inputEntry>
+        <inputEntry id="R3_alt"><text>-</text></inputEntry>
+        <inputEntry id="R3_sep"><text>&lt; 100</text></inputEntry>
+        <inputEntry id="R3_count"><text>-</text></inputEntry>
+        <inputEntry id="R3_ga"><text>-</text></inputEntry>
+        <outputEntry id="R3_out"><text>"CRITICAL"</text></outputEntry>
+        <annotationEntry><text>Less than 100 m vertical separation — collision risk, ICAO Doc 4444 §6.7 violated</text></annotationEntry>
+      </rule>
+
+      <!-- R4: Two aircraft with separation 100–200 m → HIGH -->
+      <rule id="R4">
+        <inputEntry id="R4_type"><text>"TWIN_LANDING"</text></inputEntry>
+        <inputEntry id="R4_vrate"><text>-</text></inputEntry>
+        <inputEntry id="R4_alt"><text>-</text></inputEntry>
+        <inputEntry id="R4_sep"><text>[100 .. 200)</text></inputEntry>
+        <inputEntry id="R4_count"><text>-</text></inputEntry>
+        <inputEntry id="R4_ga"><text>-</text></inputEntry>
+        <outputEntry id="R4_out"><text>"HIGH"</text></outputEntry>
+        <annotationEntry><text>Marginal separation — notify ATC immediately</text></annotationEntry>
+      </rule>
+
+      <!-- R5: Separation 200 m or more (still a violation but less critical) → MEDIUM -->
+      <rule id="R5">
+        <inputEntry id="R5_type"><text>"TWIN_LANDING"</text></inputEntry>
+        <inputEntry id="R5_vrate"><text>-</text></inputEntry>
+        <inputEntry id="R5_alt"><text>-</text></inputEntry>
+        <inputEntry id="R5_sep"><text>&gt;= 200</text></inputEntry>
+        <inputEntry id="R5_count"><text>-</text></inputEntry>
+        <inputEntry id="R5_ga"><text>-</text></inputEntry>
+        <outputEntry id="R5_out"><text>"MEDIUM"</text></outputEntry>
+        <annotationEntry><text>Separation violation detected but vertical clearance maintained</text></annotationEntry>
+      </rule>
+
+      <!-- ══════════════════════════════════════════════════════════════════
+           CEP4 — CORRIDOR OVERLOAD rules
+           ≥ 3 aircraft simultaneously in approach corridor.
+           ══════════════════════════════════════════════════════════════════ -->
+      <!-- R6: 5+ aircraft → CRITICAL (runway system saturated) -->
+      <rule id="R6">
+        <inputEntry id="R6_type"><text>"CORRIDOR_OVERLOAD"</text></inputEntry>
+        <inputEntry id="R6_vrate"><text>-</text></inputEntry>
+        <inputEntry id="R6_alt"><text>-</text></inputEntry>
+        <inputEntry id="R6_sep"><text>-</text></inputEntry>
+        <inputEntry id="R6_count"><text>&gt;= 5</text></inputEntry>
+        <inputEntry id="R6_ga"><text>-</text></inputEntry>
+        <outputEntry id="R6_out"><text>"CRITICAL"</text></outputEntry>
+        <annotationEntry><text>5+ aircraft in corridor — runway system saturated, ground stop recommended</text></annotationEntry>
+      </rule>
+
+      <!-- R7: 4 aircraft → HIGH -->
+      <rule id="R7">
+        <inputEntry id="R7_type"><text>"CORRIDOR_OVERLOAD"</text></inputEntry>
+        <inputEntry id="R7_vrate"><text>-</text></inputEntry>
+        <inputEntry id="R7_alt"><text>-</text></inputEntry>
+        <inputEntry id="R7_sep"><text>-</text></inputEntry>
+        <inputEntry id="R7_count"><text>4</text></inputEntry>
+        <inputEntry id="R7_ga"><text>-</text></inputEntry>
+        <outputEntry id="R7_out"><text>"HIGH"</text></outputEntry>
+        <annotationEntry><text>4 aircraft in corridor — ATC high workload, notify supervisor</text></annotationEntry>
+      </rule>
+
+      <!-- R8: Exactly 3 aircraft (CEP4 minimum threshold) → MEDIUM -->
+      <rule id="R8">
+        <inputEntry id="R8_type"><text>"CORRIDOR_OVERLOAD"</text></inputEntry>
+        <inputEntry id="R8_vrate"><text>-</text></inputEntry>
+        <inputEntry id="R8_alt"><text>-</text></inputEntry>
+        <inputEntry id="R8_sep"><text>-</text></inputEntry>
+        <inputEntry id="R8_count"><text>3</text></inputEntry>
+        <inputEntry id="R8_ga"><text>-</text></inputEntry>
+        <outputEntry id="R8_out"><text>"MEDIUM"</text></outputEntry>
+        <annotationEntry><text>3 aircraft in corridor — at detection threshold, monitor closely</text></annotationEntry>
+      </rule>
+
+      <!-- ══════════════════════════════════════════════════════════════════
+           CEP5 — REPEATED GO-AROUND rules
+           Same aircraft, 2 missed approaches within 30 min.
+           ══════════════════════════════════════════════════════════════════ -->
+      <!-- R9: 3+ go-arounds by same aircraft → CRITICAL (aircraft in distress?) -->
+      <rule id="R9">
+        <inputEntry id="R9_type"><text>"REPEATED_GOAROUND"</text></inputEntry>
+        <inputEntry id="R9_vrate"><text>-</text></inputEntry>
+        <inputEntry id="R9_alt"><text>-</text></inputEntry>
+        <inputEntry id="R9_sep"><text>-</text></inputEntry>
+        <inputEntry id="R9_count"><text>-</text></inputEntry>
+        <inputEntry id="R9_ga"><text>&gt;= 3</text></inputEntry>
+        <outputEntry id="R9_out"><text>"CRITICAL"</text></outputEntry>
+        <annotationEntry><text>3+ go-arounds — aircraft may be in distress (fuel, mechanical), emergency protocol</text></annotationEntry>
+      </rule>
+
+      <!-- R10: 2 go-arounds → HIGH -->
+      <rule id="R10">
+        <inputEntry id="R10_type"><text>"REPEATED_GOAROUND"</text></inputEntry>
+        <inputEntry id="R10_vrate"><text>-</text></inputEntry>
+        <inputEntry id="R10_alt"><text>-</text></inputEntry>
+        <inputEntry id="R10_sep"><text>-</text></inputEntry>
+        <inputEntry id="R10_count"><text>-</text></inputEntry>
+        <inputEntry id="R10_ga"><text>2</text></inputEntry>
+        <outputEntry id="R10_out"><text>"HIGH"</text></outputEntry>
+        <annotationEntry><text>2 go-arounds in 30 min — escalate to supervisor, check aircraft status</text></annotationEntry>
+      </rule>
+
+      <!-- ══════════════════════════════════════════════════════════════════
+           CEP1 — MISSED APPROACH rules
+           Single go-around event detected.
+           ══════════════════════════════════════════════════════════════════ -->
+      <!-- R11: Go-around very low altitude (< 250 m) → HIGH (dangerous) -->
+      <rule id="R11">
+        <inputEntry id="R11_type"><text>"MISSED_APPROACH"</text></inputEntry>
+        <inputEntry id="R11_vrate"><text>-</text></inputEntry>
+        <inputEntry id="R11_alt"><text>&lt; 250</text></inputEntry>
+        <inputEntry id="R11_sep"><text>-</text></inputEntry>
+        <inputEntry id="R11_count"><text>-</text></inputEntry>
+        <inputEntry id="R11_ga"><text>-</text></inputEntry>
+        <outputEntry id="R11_out"><text>"HIGH"</text></outputEntry>
+        <annotationEntry><text>Go-around initiated below 250 m — very low altitude, notify ATC</text></annotationEntry>
+      </rule>
+
+      <!-- R12: Standard missed approach → MEDIUM -->
+      <rule id="R12">
+        <inputEntry id="R12_type"><text>"MISSED_APPROACH"</text></inputEntry>
+        <inputEntry id="R12_vrate"><text>-</text></inputEntry>
+        <inputEntry id="R12_alt"><text>&gt;= 250</text></inputEntry>
+        <inputEntry id="R12_sep"><text>-</text></inputEntry>
+        <inputEntry id="R12_count"><text>-</text></inputEntry>
+        <inputEntry id="R12_ga"><text>-</text></inputEntry>
+        <outputEntry id="R12_out"><text>"MEDIUM"</text></outputEntry>
+        <annotationEntry><text>Standard missed approach procedure — log and monitor</text></annotationEntry>
+      </rule>
+
+      <!-- R13: Catch-all → LOW -->
+      <rule id="R13">
+        <inputEntry id="R13_type"><text>-</text></inputEntry>
+        <inputEntry id="R13_vrate"><text>-</text></inputEntry>
+        <inputEntry id="R13_alt"><text>-</text></inputEntry>
+        <inputEntry id="R13_sep"><text>-</text></inputEntry>
+        <inputEntry id="R13_count"><text>-</text></inputEntry>
+        <inputEntry id="R13_ga"><text>-</text></inputEntry>
+        <outputEntry id="R13_out"><text>"LOW"</text></outputEntry>
+        <annotationEntry><text>Default — informational alert</text></annotationEntry>
+      </rule>
+
+    </decisionTable>
+  </decision>
+
+  <!-- ── Input data reference ── -->
+  <inputData id="AlertInput" name="alert">
+    <variable id="AlertInput_var" name="alert" typeRef="AlertInput"/>
+  </inputData>
+
+</definitions>

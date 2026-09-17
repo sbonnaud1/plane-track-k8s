@@ -1,0 +1,228 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/"
+             xmlns:dmndi="https://www.omg.org/spec/DMN/20191111/DMNDI/"
+             xmlns:dc="http://www.omg.org/spec/DMN/20180521/DC/"
+             id="ActionRules"
+             name="ActionRules"
+             namespace="https://ibm.com/planetrack/decisions">
+
+  <!--
+    ============================================================================
+    DECISION TABLE: Determine Recommended Action
+    ============================================================================
+    Maps severity + alert_type to a recommended ATC action.
+    Hit policy: UNIQUE — one rule matches per combination.
+
+    Action escalation ladder:
+      MONITOR     → log, watch passively
+      NOTIFY_ATC  → alert active controller
+      GROUND_STOP → halt all departures
+      EMERGENCY   → activate fire/medical services
+    ============================================================================
+  -->
+
+  <decision id="DetermineAction" name="Determine Recommended Action">
+    <variable id="DetermineAction_output" name="recommended_action" typeRef="string"/>
+    <informationRequirement id="ir_severity">
+      <requiredDecision href="#DetermineSeverity"/>
+    </informationRequirement>
+    <informationRequirement id="ir_alert_action">
+      <requiredInput href="#AlertInput"/>
+    </informationRequirement>
+
+    <decisionTable id="ActionTable" hitPolicy="UNIQUE">
+
+      <!-- ── INPUTS ── -->
+      <input id="act_in_severity" label="Severity">
+        <inputExpression id="act_sev_expr" typeRef="string">
+          <text>severity</text>
+        </inputExpression>
+        <inputValues id="act_sev_values">
+          <text>"LOW","MEDIUM","HIGH","CRITICAL"</text>
+        </inputValues>
+      </input>
+
+      <input id="act_in_type" label="Alert Type">
+        <inputExpression id="act_type_expr" typeRef="string">
+          <text>alert.alert_type</text>
+        </inputExpression>
+        <inputValues id="act_type_values">
+          <text>"MISSED_APPROACH","TWIN_LANDING","RAPID_DESCENT","CORRIDOR_OVERLOAD","REPEATED_GOAROUND"</text>
+        </inputValues>
+      </input>
+
+      <!-- ── OUTPUTS ── -->
+      <output id="act_out_action" label="Recommended Action" name="recommended_action" typeRef="string">
+        <outputValues id="act_out_values">
+          <text>"MONITOR","NOTIFY_ATC","GROUND_STOP","EMERGENCY"</text>
+        </outputValues>
+      </output>
+      <output id="act_out_escalation" label="Escalation Required" name="escalation_required" typeRef="boolean"/>
+      <output id="act_out_color" label="Display Color" name="display_color" typeRef="string">
+        <outputValues id="act_color_values">
+          <text>"blue","yellow","orange","red"</text>
+        </outputValues>
+      </output>
+      <output id="act_out_rationale" label="Rationale" name="rationale" typeRef="string"/>
+
+      <!-- ── RULES ── -->
+
+      <!-- LOW → always MONITOR -->
+      <rule id="A1">
+        <inputEntry id="A1_sev"><text>"LOW"</text></inputEntry>
+        <inputEntry id="A1_type"><text>-</text></inputEntry>
+        <outputEntry id="A1_action"><text>"MONITOR"</text></outputEntry>
+        <outputEntry id="A1_esc"><text>false</text></outputEntry>
+        <outputEntry id="A1_color"><text>"blue"</text></outputEntry>
+        <outputEntry id="A1_rat"><text>"Informational alert — no action required"</text></outputEntry>
+      </rule>
+
+      <!-- MEDIUM + MISSED_APPROACH → MONITOR (standard procedure) -->
+      <rule id="A2">
+        <inputEntry id="A2_sev"><text>"MEDIUM"</text></inputEntry>
+        <inputEntry id="A2_type"><text>"MISSED_APPROACH"</text></inputEntry>
+        <outputEntry id="A2_action"><text>"MONITOR"</text></outputEntry>
+        <outputEntry id="A2_esc"><text>false</text></outputEntry>
+        <outputEntry id="A2_color"><text>"yellow"</text></outputEntry>
+        <outputEntry id="A2_rat"><text>"Standard missed approach — aircraft on published go-around procedure"</text></outputEntry>
+      </rule>
+
+      <!-- MEDIUM + CORRIDOR_OVERLOAD → NOTIFY_ATC -->
+      <rule id="A3">
+        <inputEntry id="A3_sev"><text>"MEDIUM"</text></inputEntry>
+        <inputEntry id="A3_type"><text>"CORRIDOR_OVERLOAD"</text></inputEntry>
+        <outputEntry id="A3_action"><text>"NOTIFY_ATC"</text></outputEntry>
+        <outputEntry id="A3_esc"><text>false</text></outputEntry>
+        <outputEntry id="A3_color"><text>"yellow"</text></outputEntry>
+        <outputEntry id="A3_rat"><text>"3 aircraft in corridor — notify controller to increase spacing"</text></outputEntry>
+      </rule>
+
+      <!-- MEDIUM + TWIN_LANDING → NOTIFY_ATC -->
+      <rule id="A4">
+        <inputEntry id="A4_sev"><text>"MEDIUM"</text></inputEntry>
+        <inputEntry id="A4_type"><text>"TWIN_LANDING"</text></inputEntry>
+        <outputEntry id="A4_action"><text>"NOTIFY_ATC"</text></outputEntry>
+        <outputEntry id="A4_esc"><text>false</text></outputEntry>
+        <outputEntry id="A4_color"><text>"yellow"</text></outputEntry>
+        <outputEntry id="A4_rat"><text>"Separation violation — vertical clearance maintained but longitudinal separation insufficient"</text></outputEntry>
+      </rule>
+
+      <!-- MEDIUM catch-all → NOTIFY_ATC -->
+      <rule id="A5">
+        <inputEntry id="A5_sev"><text>"MEDIUM"</text></inputEntry>
+        <inputEntry id="A5_type"><text>-</text></inputEntry>
+        <outputEntry id="A5_action"><text>"NOTIFY_ATC"</text></outputEntry>
+        <outputEntry id="A5_esc"><text>false</text></outputEntry>
+        <outputEntry id="A5_color"><text>"yellow"</text></outputEntry>
+        <outputEntry id="A5_rat"><text>"Medium severity alert — ATC notification recommended"</text></outputEntry>
+      </rule>
+
+      <!-- HIGH + RAPID_DESCENT → NOTIFY_ATC -->
+      <rule id="A6">
+        <inputEntry id="A6_sev"><text>"HIGH"</text></inputEntry>
+        <inputEntry id="A6_type"><text>"RAPID_DESCENT"</text></inputEntry>
+        <outputEntry id="A6_action"><text>"NOTIFY_ATC"</text></outputEntry>
+        <outputEntry id="A6_esc"><text>true</text></outputEntry>
+        <outputEntry id="A6_color"><text>"orange"</text></outputEntry>
+        <outputEntry id="A6_rat"><text>"Rapid descent at -18 m/s or below — ATC immediate notification required"</text></outputEntry>
+      </rule>
+
+      <!-- HIGH + TWIN_LANDING → NOTIFY_ATC + escalation -->
+      <rule id="A7">
+        <inputEntry id="A7_sev"><text>"HIGH"</text></inputEntry>
+        <inputEntry id="A7_type"><text>"TWIN_LANDING"</text></inputEntry>
+        <outputEntry id="A7_action"><text>"NOTIFY_ATC"</text></outputEntry>
+        <outputEntry id="A7_esc"><text>true</text></outputEntry>
+        <outputEntry id="A7_color"><text>"orange"</text></outputEntry>
+        <outputEntry id="A7_rat"><text>"Marginal separation — notify ATC and go-around the trailing aircraft"</text></outputEntry>
+      </rule>
+
+      <!-- HIGH + CORRIDOR_OVERLOAD → NOTIFY_ATC + escalation -->
+      <rule id="A8">
+        <inputEntry id="A8_sev"><text>"HIGH"</text></inputEntry>
+        <inputEntry id="A8_type"><text>"CORRIDOR_OVERLOAD"</text></inputEntry>
+        <outputEntry id="A8_action"><text>"NOTIFY_ATC"</text></outputEntry>
+        <outputEntry id="A8_esc"><text>true</text></outputEntry>
+        <outputEntry id="A8_color"><text>"orange"</text></outputEntry>
+        <outputEntry id="A8_rat"><text>"4 aircraft in corridor — high ATC workload, consider holding stack"</text></outputEntry>
+      </rule>
+
+      <!-- HIGH + REPEATED_GOAROUND → NOTIFY_ATC + escalation -->
+      <rule id="A9">
+        <inputEntry id="A9_sev"><text>"HIGH"</text></inputEntry>
+        <inputEntry id="A9_type"><text>"REPEATED_GOAROUND"</text></inputEntry>
+        <outputEntry id="A9_action"><text>"NOTIFY_ATC"</text></outputEntry>
+        <outputEntry id="A9_esc"><text>true</text></outputEntry>
+        <outputEntry id="A9_color"><text>"orange"</text></outputEntry>
+        <outputEntry id="A9_rat"><text>"2 go-arounds in 30 min — check aircraft status with crew, possible technical issue"</text></outputEntry>
+      </rule>
+
+      <!-- HIGH + MISSED_APPROACH (low altitude) → NOTIFY_ATC -->
+      <rule id="A10">
+        <inputEntry id="A10_sev"><text>"HIGH"</text></inputEntry>
+        <inputEntry id="A10_type"><text>"MISSED_APPROACH"</text></inputEntry>
+        <outputEntry id="A10_action"><text>"NOTIFY_ATC"</text></outputEntry>
+        <outputEntry id="A10_esc"><text>true</text></outputEntry>
+        <outputEntry id="A10_color"><text>"orange"</text></outputEntry>
+        <outputEntry id="A10_rat"><text>"Go-around below 250 m — dangerously low, immediate ATC coordination required"</text></outputEntry>
+      </rule>
+
+      <!-- CRITICAL + RAPID_DESCENT → EMERGENCY -->
+      <rule id="A11">
+        <inputEntry id="A11_sev"><text>"CRITICAL"</text></inputEntry>
+        <inputEntry id="A11_type"><text>"RAPID_DESCENT"</text></inputEntry>
+        <outputEntry id="A11_action"><text>"EMERGENCY"</text></outputEntry>
+        <outputEntry id="A11_esc"><text>true</text></outputEntry>
+        <outputEntry id="A11_color"><text>"red"</text></outputEntry>
+        <outputEntry id="A11_rat"><text>"Extreme descent rate below 500 m — activate emergency services (fire, medical)"</text></outputEntry>
+      </rule>
+
+      <!-- CRITICAL + TWIN_LANDING → EMERGENCY -->
+      <rule id="A12">
+        <inputEntry id="A12_sev"><text>"CRITICAL"</text></inputEntry>
+        <inputEntry id="A12_type"><text>"TWIN_LANDING"</text></inputEntry>
+        <outputEntry id="A12_action"><text>"EMERGENCY"</text></outputEntry>
+        <outputEntry id="A12_esc"><text>true</text></outputEntry>
+        <outputEntry id="A12_color"><text>"red"</text></outputEntry>
+        <outputEntry id="A12_rat"><text>"Near-collision: less than 100 m vertical separation — declare emergency, divert trailing aircraft"</text></outputEntry>
+      </rule>
+
+      <!-- CRITICAL + CORRIDOR_OVERLOAD → GROUND_STOP -->
+      <rule id="A13">
+        <inputEntry id="A13_sev"><text>"CRITICAL"</text></inputEntry>
+        <inputEntry id="A13_type"><text>"CORRIDOR_OVERLOAD"</text></inputEntry>
+        <outputEntry id="A13_action"><text>"GROUND_STOP"</text></outputEntry>
+        <outputEntry id="A13_esc"><text>true</text></outputEntry>
+        <outputEntry id="A13_color"><text>"red"</text></outputEntry>
+        <outputEntry id="A13_rat"><text>"5+ aircraft in corridor — runway system saturated, halt all departures immediately"</text></outputEntry>
+      </rule>
+
+      <!-- CRITICAL + REPEATED_GOAROUND → EMERGENCY -->
+      <rule id="A14">
+        <inputEntry id="A14_sev"><text>"CRITICAL"</text></inputEntry>
+        <inputEntry id="A14_type"><text>"REPEATED_GOAROUND"</text></inputEntry>
+        <outputEntry id="A14_action"><text>"EMERGENCY"</text></outputEntry>
+        <outputEntry id="A14_esc"><text>true</text></outputEntry>
+        <outputEntry id="A14_color"><text>"red"</text></outputEntry>
+        <outputEntry id="A14_rat"><text>"3+ go-arounds — aircraft likely in distress, activate MAYDAY protocol"</text></outputEntry>
+      </rule>
+
+      <!-- CRITICAL catch-all → EMERGENCY -->
+      <rule id="A15">
+        <inputEntry id="A15_sev"><text>"CRITICAL"</text></inputEntry>
+        <inputEntry id="A15_type"><text>-</text></inputEntry>
+        <outputEntry id="A15_action"><text>"EMERGENCY"</text></outputEntry>
+        <outputEntry id="A15_esc"><text>true</text></outputEntry>
+        <outputEntry id="A15_color"><text>"red"</text></outputEntry>
+        <outputEntry id="A15_rat"><text>"Critical alert — immediate action required"</text></outputEntry>
+      </rule>
+
+    </decisionTable>
+  </decision>
+
+  <!-- ── References ── -->
+  <inputData id="AlertInput" name="alert">
+    <variable id="AlertInput_var2" name="alert" typeRef="AlertInput"/>
+  </inputData>
+
+</definitions>

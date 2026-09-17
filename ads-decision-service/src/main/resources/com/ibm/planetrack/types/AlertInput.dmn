@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/"
+             xmlns:dmndi="https://www.omg.org/spec/DMN/20191111/DMNDI/"
+             xmlns:dc="http://www.omg.org/spec/DMN/20180521/DC/"
+             id="AlertInput"
+             name="AlertInput"
+             namespace="https://ibm.com/planetrack/types">
+
+  <!--
+    AlertInput — input data type for the flight-alert-classifier decision service.
+    Represents one CEP alert emitted by the Flink pipeline for Paris-Orly (ORY).
+
+    alert_type values:
+      MISSED_APPROACH   — CEP1: aircraft go-around detected in approach corridor
+      TWIN_LANDING      — CEP2: two aircraft < 2 NM separation on same runway axis
+      RAPID_DESCENT     — CEP3: vertical_rate < -18 m/s below 2000 m
+      CORRIDOR_OVERLOAD — CEP4: ≥ 3 aircraft simultaneously in approach corridor
+      REPEATED_GOAROUND — CEP5: same aircraft, 2 missed approaches within 30 min
+  -->
+
+  <itemDefinition id="AlertInputType" name="AlertInput" isCollection="false">
+    <itemComponent id="alert_type" name="alert_type" isCollection="false">
+      <typeRef>string</typeRef>
+      <allowedValues id="alert_type_values">
+        <text>"MISSED_APPROACH","TWIN_LANDING","RAPID_DESCENT","CORRIDOR_OVERLOAD","REPEATED_GOAROUND"</text>
+      </allowedValues>
+    </itemComponent>
+    <itemComponent id="icao24" name="icao24" isCollection="false">
+      <typeRef>string</typeRef>
+    </itemComponent>
+    <itemComponent id="callsign" name="callsign" isCollection="false">
+      <typeRef>string</typeRef>
+    </itemComponent>
+    <!-- Altitude in metres (baro_altitude from ADS-B) -->
+    <itemComponent id="baro_altitude" name="baro_altitude" isCollection="false">
+      <typeRef>number</typeRef>
+    </itemComponent>
+    <!-- Vertical rate in m/s — negative = descending -->
+    <itemComponent id="vertical_rate" name="vertical_rate" isCollection="false">
+      <typeRef>number</typeRef>
+    </itemComponent>
+    <!-- Number of aircraft simultaneously in corridor (CEP4 only, 0 otherwise) -->
+    <itemComponent id="aircraft_count" name="aircraft_count" isCollection="false">
+      <typeRef>number</typeRef>
+    </itemComponent>
+    <!-- Altitude separation between two aircraft in metres (CEP2 only, 0 otherwise) -->
+    <itemComponent id="alt_separation_m" name="alt_separation_m" isCollection="false">
+      <typeRef>number</typeRef>
+    </itemComponent>
+    <!-- Number of go-arounds by the same aircraft in the last 30 min (CEP5 only, 0 otherwise) -->
+    <itemComponent id="goaround_count" name="goaround_count" isCollection="false">
+      <typeRef>number</typeRef>
+    </itemComponent>
+    <!-- UTC detection timestamp as ISO-8601 string -->
+    <itemComponent id="detection_ts" name="detection_ts" isCollection="false">
+      <typeRef>string</typeRef>
+    </itemComponent>
+  </itemDefinition>
+
+</definitions>
