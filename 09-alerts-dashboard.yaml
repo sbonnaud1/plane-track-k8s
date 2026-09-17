@@ -743,6 +743,30 @@ data:
                       padding:1px 6px; font-size:12px; color:#79c0ff; }
         .about strong { color:#e6edf3; }
 
+        /* schema reference tables */
+        .schema-table { width:100%; border-collapse:collapse; margin-top:10px; margin-bottom:20px;
+                        font-size:12px; }
+        .schema-table thead tr { background:#1a2233; }
+        .schema-table th { padding:7px 10px; text-align:left; font-weight:600;
+                           color:#8b949e; border-bottom:1px solid #30363d; white-space:nowrap; }
+        .schema-table td { padding:6px 10px; border-bottom:1px solid #21262d;
+                           vertical-align:top; color:#c9d1d9; line-height:1.5; }
+        .schema-table tr:last-child td { border-bottom:none; }
+        .schema-table tbody tr:hover td { background:#161b22; }
+        .schema-table td:nth-child(2) { color:#8b949e; white-space:nowrap; }
+
+        /* HTTP method badges */
+        .http-method { display:inline-block; padding:1px 8px; border-radius:4px;
+                       font-size:11px; font-weight:700; font-family:monospace; }
+        .http-method.get  { background:#1a3a1a; color:#3fb950; border:1px solid #2a5a2a; }
+        .http-method.post { background:#3a2a00; color:#d29922; border:1px solid #5a4a00; }
+
+        /* Prometheus type badges */
+        .prom-type { display:inline-block; padding:1px 7px; border-radius:4px;
+                     font-size:10px; font-weight:600; text-transform:uppercase; }
+        .prom-type.counter { background:#1a2a3a; color:#79c0ff; border:1px solid #2a4a6a; }
+        .prom-type.gauge   { background:#1a2a1a; color:#3fb950; border:1px solid #2a4a2a; }
+
         /* stack pills */
         .pills { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
         .pill  { background:#21262d; border:1px solid #30363d; border-radius:20px;
@@ -902,6 +926,7 @@ data:
         <div class="tab"        id="tab-btn-events">🧪 Simulated Flight Events</div>
         <div class="tab"        id="tab-btn-live">📡 Live — OpenSky ADS-B<span class="tab-badge empty" id="tab-badge-live">0</span></div>
         <div class="tab"        id="tab-btn-tracker">✈ Aviation Flight Tracker</div>
+        <div class="tab"        id="tab-btn-schemas">📋 Schemas &amp; API</div>
         <div class="tab"        id="tab-btn-about">📖 About &amp; Architecture</div>
       </div>
 
@@ -1368,6 +1393,276 @@ data:
 
         </div>
       </div><!-- /tab-about -->
+
+      <!-- ══════════════════════ TAB: SCHEMAS & API ══════════════════════ -->
+      <div id="tab-schemas" class="tabcontent">
+        <div class="about">
+
+          <h2>📋 Schemas &amp; API Reference</h2>
+          <p class="subtitle">
+            Kafka topic payloads, REST API endpoints, and Prometheus metrics
+            exposed by the <code>alerts-dashboard</code> service.
+          </p>
+
+          <!-- ── Kafka topics overview ── -->
+          <h3>🗂 Kafka Topics</h3>
+          <div class="pills" style="margin-bottom:18px">
+            <div class="pill"><span>adsb_raw</span> — raw ADS-B state vectors (producer → Flink)</div>
+            <div class="pill"><span>ory_missed_approach</span> — CEP output · MATCH_RECOGNIZE</div>
+            <div class="pill"><span>ory_twin_landing</span> — CEP output · HOP window self-join</div>
+            <div class="pill"><span>ory_repeated_goaround</span> — CEP output · chained stream join</div>
+            <div class="pill"><span>ory_rapid_descent</span> — CEP output · threshold filter</div>
+            <div class="pill"><span>ory_corridor_overload</span> — CEP output · TUMBLE window count</div>
+          </div>
+
+          <!-- ── adsb_raw ── -->
+          <h3>📥 Topic: <code>adsb_raw</code></h3>
+          <p>Published by <code>adsb-producer</code> (live) and <code>adsb-simulator</code> (synthetic <code>SIM*</code>).
+             Consumed by all 5 Flink SQL CEP jobs and the raw-vectors consumer in the dashboard.</p>
+          <table class="schema-table">
+            <thead><tr><th>Field</th><th>Type</th><th>Example</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td><code>icao24</code></td><td>string</td><td><code>"3949b6"</code></td><td>ICAO 24-bit hex transponder address. Simulator prefixes <code>SIM</code></td></tr>
+              <tr><td><code>callsign</code></td><td>string</td><td><code>"AFR123 "</code></td><td>Flight callsign (may be padded with spaces or null)</td></tr>
+              <tr><td><code>baro_altitude</code></td><td>float</td><td><code>880.0</code></td><td>Barometric altitude in metres (null when on ground)</td></tr>
+              <tr><td><code>geo_altitude</code></td><td>float</td><td><code>914.0</code></td><td>Geometric / GPS altitude in metres</td></tr>
+              <tr><td><code>longitude</code></td><td>float</td><td><code>2.3791</code></td><td>WGS-84 longitude in decimal degrees</td></tr>
+              <tr><td><code>latitude</code></td><td>float</td><td><code>48.7239</code></td><td>WGS-84 latitude in decimal degrees</td></tr>
+              <tr><td><code>velocity</code></td><td>float</td><td><code>72.4</code></td><td>Ground speed in m/s</td></tr>
+              <tr><td><code>vertical_rate</code></td><td>float</td><td><code>-4.2</code></td><td>Vertical rate in m/s (negative = descending)</td></tr>
+              <tr><td><code>on_ground</code></td><td>bool</td><td><code>false</code></td><td>True when the aircraft is weight-on-wheels</td></tr>
+              <tr><td><code>time_position</code></td><td>int</td><td><code>1718123456</code></td><td>Unix epoch of the last position update (seconds)</td></tr>
+              <tr><td><code>true_track</code></td><td>float</td><td><code>247.3</code></td><td>Track angle in degrees (clockwise from north)</td></tr>
+              <tr><td><code>squawk</code></td><td>string</td><td><code>"1000"</code></td><td>Transponder squawk code (4-digit octal)</td></tr>
+              <tr><td><code>origin_country</code></td><td>string</td><td><code>"France"</code></td><td>Country of registration derived from ICAO block</td></tr>
+            </tbody>
+          </table>
+
+          <!-- ── ory_missed_approach ── -->
+          <h3>🔴 Topic: <code>ory_missed_approach</code></h3>
+          <p>Emitted by Flink <code>MATCH_RECOGNIZE</code> when pattern <strong>A → B* → C</strong> fires within a 10-minute event window.
+             Also feeds into <code>ory_repeated_goaround</code> via a chained Flink job.</p>
+          <table class="schema-table">
+            <thead><tr><th>Field</th><th>Type</th><th>Example</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td><code>icao24</code></td><td>string</td><td><code>"3949b6"</code></td><td>Aircraft transponder address</td></tr>
+              <tr><td><code>callsign</code></td><td>string</td><td><code>"AFR123"</code></td><td>Flight callsign at time of detection</td></tr>
+              <tr><td><code>go_around_alt</code></td><td>float</td><td><code>420.0</code></td><td>Altitude in metres at the moment the go-around was confirmed (event C)</td></tr>
+              <tr><td><code>go_around_vrate</code></td><td>float</td><td><code>5.2</code></td><td>Positive vertical rate (m/s) confirming the climb-away</td></tr>
+              <tr><td><code>approach_alt</code></td><td>float</td><td><code>880.0</code></td><td>Altitude in metres at the initial approach event (event A)</td></tr>
+              <tr><td><code>detection_ts</code></td><td>string (ISO-8601)</td><td><code>"2024-06-11T14:32:01Z"</code></td><td>Timestamp of pattern completion (Flink watermark time)</td></tr>
+            </tbody>
+          </table>
+
+          <!-- ── ory_twin_landing ── -->
+          <h3>🟡 Topic: <code>ory_twin_landing</code></h3>
+          <p>Emitted when two <em>distinct</em> aircraft are simultaneously inside the short-final zone
+             within the same <strong>HOP window (90 s width, 10 s slide)</strong>. Self-join on <code>icao24 &lt;&gt; icao24_b</code>.</p>
+          <table class="schema-table">
+            <thead><tr><th>Field</th><th>Type</th><th>Example</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td><code>icao24_a</code></td><td>string</td><td><code>"3949b6"</code></td><td>First aircraft (lower ICAO24 lexicographically)</td></tr>
+              <tr><td><code>callsign_a</code></td><td>string</td><td><code>"AFR123"</code></td><td>Callsign of the first aircraft</td></tr>
+              <tr><td><code>alt_a</code></td><td>float</td><td><code>760.0</code></td><td>Altitude of the first aircraft (metres) in the HOP window</td></tr>
+              <tr><td><code>icao24_b</code></td><td>string</td><td><code>"4016b4"</code></td><td>Second aircraft (higher ICAO24 lexicographically)</td></tr>
+              <tr><td><code>callsign_b</code></td><td>string</td><td><code>"EZY456"</code></td><td>Callsign of the second aircraft</td></tr>
+              <tr><td><code>alt_b</code></td><td>float</td><td><code>810.0</code></td><td>Altitude of the second aircraft (metres)</td></tr>
+              <tr><td><code>detection_ts</code></td><td>string (ISO-8601)</td><td><code>"2024-06-11T14:35:22Z"</code></td><td>Timestamp of HOP window close</td></tr>
+            </tbody>
+          </table>
+
+          <!-- ── ory_repeated_goaround ── -->
+          <h3>🔁 Topic: <code>ory_repeated_goaround</code></h3>
+          <p>Emitted when the <em>same</em> aircraft generates two missed-approach events within
+             a <strong>30-minute window</strong>. Chained Flink SQL job consuming <code>ory_missed_approach</code>.</p>
+          <table class="schema-table">
+            <thead><tr><th>Field</th><th>Type</th><th>Example</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td><code>icao24</code></td><td>string</td><td><code>"3949b6"</code></td><td>Aircraft that missed approach twice</td></tr>
+              <tr><td><code>callsign</code></td><td>string</td><td><code>"AFR123"</code></td><td>Callsign (from first go-around event)</td></tr>
+              <tr><td><code>goaround_1</code></td><td>string (ISO-8601)</td><td><code>"2024-06-11T14:32:01Z"</code></td><td>Timestamp of the first go-around</td></tr>
+              <tr><td><code>goaround_2</code></td><td>string (ISO-8601)</td><td><code>"2024-06-11T14:55:40Z"</code></td><td>Timestamp of the second go-around (within 30 min of first)</td></tr>
+              <tr><td><code>detection_ts</code></td><td>string (ISO-8601)</td><td><code>"2024-06-11T14:55:41Z"</code></td><td>Flink watermark time at pattern completion</td></tr>
+            </tbody>
+          </table>
+
+          <!-- ── ory_rapid_descent ── -->
+          <h3>🔻 Topic: <code>ory_rapid_descent</code></h3>
+          <p>Emitted when a single ADS-B vector crosses both thresholds simultaneously — no temporal window.
+             Pure stateless filter applied to the <code>adsb_raw</code> stream.</p>
+          <table class="schema-table">
+            <thead><tr><th>Field</th><th>Type</th><th>Example</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td><code>icao24</code></td><td>string</td><td><code>"3949b6"</code></td><td>Aircraft transponder address</td></tr>
+              <tr><td><code>callsign</code></td><td>string</td><td><code>"AFR123"</code></td><td>Flight callsign</td></tr>
+              <tr><td><code>baro_altitude</code></td><td>float</td><td><code>1450.0</code></td><td>Altitude at detection (&lt; 2 000 m threshold)</td></tr>
+              <tr><td><code>vertical_rate</code></td><td>float</td><td><code>-22.3</code></td><td>Vertical rate at detection (&lt; −18 m/s threshold ≈ 3 540 ft/min)</td></tr>
+              <tr><td><code>detection_ts</code></td><td>string (ISO-8601)</td><td><code>"2024-06-11T14:40:15Z"</code></td><td>Timestamp of the triggering ADS-B vector</td></tr>
+            </tbody>
+          </table>
+
+          <!-- ── ory_corridor_overload ── -->
+          <h3>🔵 Topic: <code>ory_corridor_overload</code></h3>
+          <p>Emitted at the close of each <strong>TUMBLE(30 s)</strong> window when three or more distinct
+             aircraft are present in the ORY approach corridor simultaneously.</p>
+          <table class="schema-table">
+            <thead><tr><th>Field</th><th>Type</th><th>Example</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td><code>aircraft_count</code></td><td>int</td><td><code>4</code></td><td>Number of distinct <code>icao24</code> values in the TUMBLE window (≥ 3)</td></tr>
+              <tr><td><code>window_start</code></td><td>string (ISO-8601)</td><td><code>"2024-06-11T14:41:00Z"</code></td><td>Start of the 30-second tumbling window</td></tr>
+              <tr><td><code>window_end</code></td><td>string (ISO-8601)</td><td><code>"2024-06-11T14:41:30Z"</code></td><td>End of the 30-second tumbling window</td></tr>
+              <tr><td><code>detection_ts</code></td><td>string (ISO-8601)</td><td><code>"2024-06-11T14:41:30Z"</code></td><td>Flink watermark time at window close</td></tr>
+            </tbody>
+          </table>
+
+          <!-- ── Internal fields added by dashboard ── -->
+          <h3>🔖 Dashboard-injected fields (all topics)</h3>
+          <p>The Flask consumer adds these fields to every alert before storing it in the in-memory deque.
+             They are present in all <code>/api/alerts</code> responses.</p>
+          <table class="schema-table">
+            <thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td><code>_topic</code></td><td>string</td><td>Kafka topic name (e.g. <code>ory_missed_approach</code>)</td></tr>
+              <tr><td><code>_received_at</code></td><td>string</td><td>Wall-clock time when the dashboard consumer received the message (<code>HH:MM:SS UTC</code>)</td></tr>
+              <tr><td><code>_received_epoch</code></td><td>float</td><td>Unix epoch (seconds) of reception — used for age display in the UI</td></tr>
+              <tr><td><code>_simulated</code></td><td>bool</td><td>True when all <code>icao24</code> fields start with <code>SIM</code></td></tr>
+              <tr><td><code>_id</code></td><td>int</td><td>Monotonic counter per pod lifetime — stable card key in the UI</td></tr>
+              <tr><td><code>_ads_severity</code></td><td>string?</td><td>IBM ADS classification: <code>CRITICAL</code> | <code>HIGH</code> | <code>MEDIUM</code> | <code>LOW</code> | <code>INFO</code> (present only when ADS_ENABLED=true)</td></tr>
+              <tr><td><code>_ads_recommended_action</code></td><td>string?</td><td>ADS recommended ATC action (present only when ADS_ENABLED=true)</td></tr>
+              <tr><td><code>_ads_escalation_required</code></td><td>bool?</td><td>ADS escalation flag (present only when ADS_ENABLED=true)</td></tr>
+              <tr><td><code>_ads_rationale</code></td><td>string?</td><td>ADS decision rationale text (present only when ADS_ENABLED=true)</td></tr>
+              <tr><td><code>_ads_display_color</code></td><td>string?</td><td>ADS suggested UI colour hex (present only when ADS_ENABLED=true)</td></tr>
+            </tbody>
+          </table>
+
+          <!-- ── REST API ── -->
+          <h3>🌐 REST API Endpoints</h3>
+          <table class="schema-table">
+            <thead><tr><th>Method</th><th>Path</th><th>Description</th><th>Response shape</th></tr></thead>
+            <tbody>
+              <tr>
+                <td><span class="http-method get">GET</span></td>
+                <td><code>/</code></td>
+                <td>Main dashboard HTML page</td>
+                <td>HTML 200</td>
+              </tr>
+              <tr>
+                <td><span class="http-method get">GET</span></td>
+                <td><code>/api/alerts</code></td>
+                <td>Last 200 CEP alerts (newest first), all topics</td>
+                <td><code>[ {alert}, … ]</code></td>
+              </tr>
+              <tr>
+                <td><span class="http-method get">GET</span></td>
+                <td><code>/api/alert/:id</code></td>
+                <td>Single alert by its <code>_id</code> position in the deque</td>
+                <td><code>{alert}</code> or <code>{"error":"not found"}</code></td>
+              </tr>
+              <tr>
+                <td><span class="http-method get">GET</span></td>
+                <td><code>/api/raw</code></td>
+                <td>Last 200 raw ADS-B vectors from <code>adsb_raw</code></td>
+                <td><code>[ {vector}, … ]</code></td>
+              </tr>
+              <tr>
+                <td><span class="http-method get">GET</span></td>
+                <td><code>/api/tracker</code></td>
+                <td>Current OpenSky state vectors for the ORY bounding box (cached, refreshed every 60 s)</td>
+                <td><code>{"states":[[…],…], "fetched_at":"HH:MM:SS UTC", "error":null}</code></td>
+              </tr>
+              <tr>
+                <td><span class="http-method get">GET</span></td>
+                <td><code>/api/health</code></td>
+                <td>Flink CEP job health check</td>
+                <td><code>{"flink_status":"RUNNING", "job_id":"…", "job_name":"…"}</code></td>
+              </tr>
+              <tr>
+                <td><span class="http-method get">GET</span></td>
+                <td><code>/healthz</code></td>
+                <td>Kubernetes liveness probe</td>
+                <td><code>ok</code> 200</td>
+              </tr>
+              <tr>
+                <td><span class="http-method get">GET</span></td>
+                <td><code>/metrics</code></td>
+                <td>Prometheus scrape endpoint (prometheus-flask-exporter)</td>
+                <td>Prometheus text format</td>
+              </tr>
+              <tr>
+                <td><span class="http-method post">POST</span></td>
+                <td><code>/sim/reset</code></td>
+                <td>Seek all consumers to end and clear in-memory state (simulator reset)</td>
+                <td><code>{"status":"ok"}</code></td>
+              </tr>
+            </tbody>
+          </table>
+
+          <!-- ── Prometheus metrics ── -->
+          <h3>📊 Prometheus Metrics</h3>
+          <p>Exposed at <code>/metrics</code> — scraped by Prometheus user-workload via ServiceMonitor
+             in the <code>plane-track</code> namespace.</p>
+          <table class="schema-table">
+            <thead><tr><th>Metric</th><th>Type</th><th>Labels</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr>
+                <td><code>cep_alerts_total</code></td>
+                <td><span class="prom-type counter">Counter</span></td>
+                <td><code>topic, source</code></td>
+                <td>Total CEP alerts accepted after deduplication. <code>source</code> = <code>live</code> | <code>simulated</code></td>
+              </tr>
+              <tr>
+                <td><code>cep_alerts_in_window</code></td>
+                <td><span class="prom-type gauge">Gauge</span></td>
+                <td><code>topic, source</code></td>
+                <td>Current number of alerts held in the 200-entry dashboard deque — updated every 10 s</td>
+              </tr>
+              <tr>
+                <td><code>adsb_raw_vectors_total</code></td>
+                <td><span class="prom-type gauge">Gauge</span></td>
+                <td>—</td>
+                <td>Number of raw ADS-B vectors currently in memory (max 200)</td>
+              </tr>
+              <tr>
+                <td><code>cep_ads_decisions_total</code></td>
+                <td><span class="prom-type counter">Counter</span></td>
+                <td><code>severity</code></td>
+                <td>Total IBM ADS enrichments applied. <code>severity</code> = <code>CRITICAL</code> | <code>HIGH</code> | <code>MEDIUM</code> | <code>LOW</code> | <code>INFO</code></td>
+              </tr>
+              <tr>
+                <td><code>up</code></td>
+                <td><span class="prom-type gauge">Gauge</span></td>
+                <td><code>job="alerts-dashboard"</code></td>
+                <td>Standard Prometheus target health — 1 when the scrape succeeds</td>
+              </tr>
+            </tbody>
+          </table>
+
+          <!-- ── OpenSky /api/tracker states array ── -->
+          <h3>🛩 OpenSky State Vector (<code>/api/tracker</code> → <code>states[]</code>)</h3>
+          <p>Each element of the <code>states</code> array is an anonymous list following the
+             <a href="https://openskynetwork.github.io/opensky-api/rest.html" target="_blank" rel="noopener">OpenSky REST v1 schema</a>.
+             Index positions (0-based):</p>
+          <table class="schema-table">
+            <thead><tr><th>Index</th><th>Field</th><th>Type</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td>0</td><td><code>icao24</code></td><td>string</td><td>ICAO 24-bit hex address</td></tr>
+              <tr><td>1</td><td><code>callsign</code></td><td>string?</td><td>Callsign (may be null or padded with spaces)</td></tr>
+              <tr><td>2</td><td><code>origin_country</code></td><td>string</td><td>Country of registration</td></tr>
+              <tr><td>3</td><td><code>time_position</code></td><td>int?</td><td>Unix epoch of last position update</td></tr>
+              <tr><td>4</td><td><code>last_contact</code></td><td>int</td><td>Unix epoch of last ADS-B message received</td></tr>
+              <tr><td>5</td><td><code>longitude</code></td><td>float?</td><td>WGS-84 longitude (decimal degrees)</td></tr>
+              <tr><td>6</td><td><code>latitude</code></td><td>float?</td><td>WGS-84 latitude (decimal degrees)</td></tr>
+              <tr><td>7</td><td><code>baro_altitude</code></td><td>float?</td><td>Barometric altitude (metres, null on ground)</td></tr>
+              <tr><td>8</td><td><code>on_ground</code></td><td>bool</td><td>Weight-on-wheels flag</td></tr>
+              <tr><td>9</td><td><code>velocity</code></td><td>float?</td><td>Ground speed (m/s)</td></tr>
+              <tr><td>10</td><td><code>true_track</code></td><td>float?</td><td>Track angle in degrees (clockwise from north)</td></tr>
+              <tr><td>11</td><td><code>vertical_rate</code></td><td>float?</td><td>Vertical rate (m/s)</td></tr>
+              <tr><td>14</td><td><code>squawk</code></td><td>string?</td><td>Transponder squawk code</td></tr>
+            </tbody>
+          </table>
+
+        </div>
+      </div><!-- /tab-schemas -->
 
       <!-- ══════════════════════ POPOVERS ══════════════════════ -->
 
