@@ -43,6 +43,20 @@ data:
     TOPICS     = ["ory_missed_approach", "ory_twin_landing",
                   "ory_repeated_goaround", "ory_rapid_descent", "ory_corridor_overload"]
     PORT       = int(os.environ.get("PORT", "8080"))
+
+    # ── IBM ADS integration (optional) ───────────────────────────────────────
+    # Set ADS_ENABLED=true + ADS_ENDPOINT + ADS_API_KEY to enrich each alert.
+    #
+    # ADS_ENDPOINT: full runtime execute URL, e.g.
+    #   https://<ads-runtime-host>/deploymentSpaces/embedded/decisions/<decisionId>/operations/classifyFlightAlert/execute
+    # Find the exact URL in ADS Decision Center after deploying the service:
+    #   Help icon → "API access" → copy the execute URL for classifyFlightAlert.
+    # ADS_API_KEY: a ZenApiKey token (generate in Decision Center → Settings → API access).
+    ADS_ENABLED  = os.environ.get("ADS_ENABLED", "false").lower() == "true"
+    ADS_ENDPOINT = os.environ.get("ADS_ENDPOINT", "").rstrip("/")
+    ADS_API_KEY  = os.environ.get("ADS_API_KEY", "")
+    # Per-alert ADS call timeout (seconds) — keep short to avoid blocking the consumer
+    ADS_TIMEOUT  = int(os.environ.get("ADS_TIMEOUT", "3"))
     MAX_ALERTS = 200
     MAX_RAW    = 200  # max raw ADS-B vectors kept in memory for Flight Events tab
 
@@ -69,15 +83,22 @@ data:
             "adsb_raw_vectors_total",
             "Number of raw ADS-B vectors currently in memory"
         )
+        # ADS decision counter — incremented on every successful ADS enrichment
+        _cep_ads_decisions_total = Counter(
+            "cep_ads_decisions_total",
+            "Total IBM ADS enrichments applied to CEP alerts",
+            ["severity"]   # severity = CRITICAL | HIGH | MEDIUM | LOW | INFO
+        )
     except (ImportError, Exception):
         # prometheus_client not available — define no-op stubs so _consume() still works
         class _NoOp:
             def labels(self, **_): return self
             def inc(self): pass
             def set(self, _): pass
-        _cep_alerts_total    = _NoOp()
-        _cep_alerts_in_window = _NoOp()
-        _adsb_raw_vectors    = _NoOp()
+        _cep_alerts_total        = _NoOp()
+        _cep_alerts_in_window    = _NoOp()
+        _adsb_raw_vectors        = _NoOp()
+        _cep_ads_decisions_total = _NoOp()
 
     _alerts: deque = deque(maxlen=MAX_ALERTS)
     _raw:    deque = deque(maxlen=MAX_RAW)   # latest raw ADS-B vectors
@@ -105,6 +126,62 @@ data:
             if val and not str(val).upper().startswith("SIM"):
                 return False
         return True
+
+    # ── IBM ADS enrichment ───────────────────────────────────────────────────
+    def _classify_with_ads(alert: dict) -> dict:
+        """
+        Call the IBM ADS flight-alert-classifier decision service.
+        Returns a dict with keys: severity, recommended_action,
+        escalation_required, rationale, display_color.
+        Returns an empty dict (no enrichment) on any error or if ADS is disabled.
+        """
+        if not ADS_ENABLED or not ADS_ENDPOINT:
+            return {}
+        topic = alert.get("_topic", "")
+        # Map Kafka topic to ADS alert_type
+        _TYPE_MAP = {
+            "ory_missed_approach":   "MISSED_APPROACH",
+            "ory_twin_landing":      "TWIN_LANDING",
+            "ory_rapid_descent":     "RAPID_DESCENT",
+            "ory_corridor_overload": "CORRIDOR_OVERLOAD",
+            "ory_repeated_goaround": "REPEATED_GOAROUND",
+        }
+        alert_type = _TYPE_MAP.get(topic)
+        if not alert_type:
+            return {}
+        # Build ADS request payload
+        payload = {
+            "alert": {
+                "alert_type":       alert_type,
+                "icao24":           alert.get("icao24") or alert.get("icao24_a") or "",
+                "callsign":         alert.get("callsign") or alert.get("callsign_a") or "",
+                "baro_altitude":    float(alert.get("baro_altitude") or alert.get("go_around_alt") or 0),
+                "vertical_rate":    float(alert.get("vertical_rate") or 0),
+                "aircraft_count":   int(alert.get("aircraft_count") or 0),
+                "alt_separation_m": abs(float((alert.get("alt_a") or 0) - (alert.get("alt_b") or 0))),
+                "goaround_count":   2 if topic == "ory_repeated_goaround" else 0,
+                "detection_ts":     str(alert.get("detection_ts") or ""),
+            }
+        }
+        # ADS runtime execute expects: {"input": {<dmn-input-vars>}}
+        # and returns: {"output": {<dmn-output-vars>}, "executionId": ...}
+        try:
+            resp = _requests.post(
+                ADS_ENDPOINT,
+                json={"input": payload},
+                headers={
+                    "Authorization": f"ZenApiKey {ADS_API_KEY}",
+                    "Content-Type":  "application/json",
+                },
+                timeout=ADS_TIMEOUT,
+            )
+            resp.raise_for_status()
+            result = resp.json()
+            # Extract the DMN output (nested under "output" key)
+            return result.get("output") or result
+        except Exception as exc:
+            print(f"[dashboard] ADS call failed for {topic}: {exc}", flush=True)
+            return {}
 
     def _dedup_key(alert: dict):
         """Return a (topic, canonical_id) dedup key for any alert topic."""
@@ -172,6 +249,16 @@ data:
                         _dedup_seen[dk] = now_epoch
                         _seq += 1
                         alert["_id"] = _seq
+                        # ── IBM ADS enrichment (non-blocking best-effort) ────
+                        ads_result = _classify_with_ads(alert)
+                        if ads_result:
+                            _sev = ads_result.get("severity", "UNKNOWN")
+                            alert["_ads_severity"]            = _sev
+                            alert["_ads_recommended_action"]  = ads_result.get("recommended_action", "")
+                            alert["_ads_escalation_required"] = ads_result.get("escalation_required", False)
+                            alert["_ads_rationale"]           = ads_result.get("rationale", "")
+                            alert["_ads_display_color"]       = ads_result.get("display_color", "")
+                            _cep_ads_decisions_total.labels(severity=_sev).inc()
                         _alerts.appendleft(alert)
                         # ── Prometheus counters ──────────────────────────────
                         _src = "simulated" if alert["_simulated"] else "live"
@@ -1664,10 +1751,38 @@ data:
               ' <span class="muted">in corridor ' + ws + '–' + we + '</span>';
           }
 
+          // ── IBM ADS decision badge (shown only when ADS enrichment present) ──
+          var adsBadge = '';
+          if (a._ads_severity) {
+            var _ADS_COLOR = {
+              'LOW':      '#3b82f6',   // blue
+              'MEDIUM':   '#f59e0b',   // yellow/amber
+              'HIGH':     '#f97316',   // orange
+              'CRITICAL': '#ef4444'    // red
+            };
+            var _ADS_ACTION_ICON = {
+              'MONITOR':     '👁',
+              'NOTIFY_ATC':  '📡',
+              'GROUND_STOP': '⛔',
+              'EMERGENCY':   '🚨'
+            };
+            var adsColor  = _ADS_COLOR[a._ads_severity] || '#888';
+            var adsIcon   = _ADS_ACTION_ICON[a._ads_recommended_action] || '⚙';
+            var adsTitle  = (a._ads_rationale || '').replace(/"/g, '&quot;');
+            adsBadge = '<span class="ads-badge" title="ADS: ' + adsTitle + '" ' +
+              'style="background:' + adsColor + ';color:#fff;font-size:0.72rem;' +
+              'padding:1px 6px;border-radius:4px;margin-left:6px;font-weight:600;' +
+              'white-space:nowrap;cursor:default;">' +
+              adsIcon + '&nbsp;' + a._ads_severity +
+              (a._ads_recommended_action ? '&nbsp;·&nbsp;' + a._ads_recommended_action : '') +
+              '</span>';
+          }
+
           return '<div class="card ' + meta.cls + newCls + '">' +
             '<div class="card-line1">' +
               '<span class="badge ' + meta.badge + '">' + meta.label + '</span>' +
               '<span class="card-body">' + body + '</span>' +
+              adsBadge +
               '<span class="card-ts">' + ts + '</span>' +
               age +
               '<span class="card-sep">·</span>' +
@@ -2012,6 +2127,56 @@ data:
         function fmt(v) { return v != null ? Math.round(v) : '—'; }
         function fmtFt(m) { return m != null ? Math.round(m * 3.281) + ' ft' : '—'; }
 
+        /* ─── Shared IBM ADS Decision section ─── */
+        function _adsSection(a) {
+          if (!a._ads_severity) return '';
+          var _SEV_COLOR = {
+            'CRITICAL': '#f85149', 'HIGH': '#d29922',
+            'MEDIUM': '#e3b341',   'LOW': '#3fb950', 'INFO': '#79c0ff'
+          };
+          var _SEV_BG = {
+            'CRITICAL': '#2d1010', 'HIGH': '#2d2000',
+            'MEDIUM': '#2a2000',   'LOW': '#0d2a0d', 'INFO': '#0d1a2a'
+          };
+          var _ACT_ICON = {
+            'IMMEDIATE_ATC_INTERVENTION': '&#128680;',
+            'ALERT_ATC_SUPERVISOR':       '&#9888;',
+            'NOTIFY_ATC':                 '&#128226;',
+            'LOG_AND_MONITOR':            '&#128203;',
+            'ROUTINE_LOG':                '&#128221;'
+          };
+          var sev     = (a._ads_severity || '').toUpperCase();
+          var col     = _SEV_COLOR[sev] || '#888';
+          var bg      = _SEV_BG[sev]   || '#1c1c1c';
+          var act     = a._ads_recommended_action || '\u2014';
+          var actIcon = _ACT_ICON[a._ads_recommended_action] || '&#9881;';
+          var esc     = a._ads_escalation_required;
+          var rat     = a._ads_rationale || '\u2014';
+
+          return '' +
+            '<h3 style="margin-top:20px;border-top:1px solid #21262d;padding-top:12px;">' +
+            '<span style="color:#79c0ff;">&#9889;</span> IBM ADS Decision</h3>' +
+            '<div style="background:' + bg + ';border:1px solid ' + col + ';border-radius:6px;padding:12px 14px;margin-bottom:8px;">' +
+            '  <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">' +
+            '    <span style="background:' + col + ';color:#0d1117;font-weight:700;font-size:11px;padding:2px 8px;border-radius:4px;letter-spacing:.5px;">' + sev + '</span>' +
+            (esc ? '<span style="background:#f85149;color:#0d1117;font-weight:700;font-size:10px;padding:2px 6px;border-radius:4px;">ESCALATE</span>' : '') +
+            '  </div>' +
+            '  <div class="fact-grid" style="margin-bottom:8px;">' +
+            '    <div class="fact" style="border-color:' + col + '">' +
+            '      <div class="label">Recommended action</div>' +
+            '      <div class="value" style="color:' + col + ';font-size:12px;">' + actIcon + '&nbsp;' + act.replace(/_/g, ' ') + '</div>' +
+            '    </div>' +
+            '    <div class="fact"><div class="label">Escalation required</div>' +
+            '      <div class="value ' + (esc ? 'red' : 'green') + '">' + (esc ? 'Yes' : 'No') + '</div></div>' +
+            '  </div>' +
+            '  <div style="font-size:12px;color:#c9d1d9;line-height:1.6;border-top:1px solid #30363d;padding-top:8px;">' +
+            '    <span style="color:#8b949e;font-size:11px;">Rationale:</span><br>' + rat +
+            '  </div>' +
+            '</div>' +
+            '<p style="font-size:11px;color:#57606a;margin-top:2px;">Decision by <strong style="color:#79c0ff;">IBM Automation Decision Services</strong> \u00b7 flight-alert-classifier \u00b7 classifyFlightAlert</p>';
+        }
+
+
         function buildDrawerHTML(a) {
           if (a._topic === 'ory_missed_approach')  return buildMA(a);
           if (a._topic === 'ory_twin_landing')     return buildTW(a);
@@ -2100,7 +2265,8 @@ data:
             '<h3>Detection</h3>' +
             '<p>Detected at <strong>' + (a._received_at || '—') + '</strong> via Flink <code>MATCH_RECOGNIZE</code> pattern running on the <code>ory_approach_events</code> view.<br>' +
             'Alert published to Kafka topic <code>ory_missed_approach</code> and consumed by this dashboard.</p>' +
-            (a.approach_ts ? '<p style="color:#8b949e;font-size:11px;">approach_ts: ' + a.approach_ts + (a.go_around_ts ? ' · go_around_ts: ' + a.go_around_ts : '') + '</p>' : '');
+            (a.approach_ts ? '<p style="color:#8b949e;font-size:11px;">approach_ts: ' + a.approach_ts + (a.go_around_ts ? ' · go_around_ts: ' + a.go_around_ts : '') + '</p>' : '') +
+            _adsSection(a);
         }
 
         /* ─── Twin Landing drawer ─── */
@@ -2178,7 +2344,8 @@ data:
             '<h3>Detection</h3>' +
             '<p>Detected at <strong>' + (a._received_at || '—') + '</strong> via Flink <code>HOP(90 s, 10 s)</code> window self-join on <code>ory_short_final</code>.<br>' +
             'Alert published to Kafka topic <code>ory_twin_landing</code>.</p>' +
-            (a.window_start ? '<p style="color:#8b949e;font-size:11px;">Window: ' + a.window_start + ' → ' + a.window_end + '</p>' : '');
+            (a.window_start ? '<p style="color:#8b949e;font-size:11px;">Window: ' + a.window_start + ' → ' + a.window_end + '</p>' : '') +
+            _adsSection(a);
         }
 
         /* ─── Repeat Go-Around drawer ─── */
@@ -2242,7 +2409,8 @@ data:
 
             '<h3>Detection</h3>' +
             '<p>Detected at <strong>' + (a._received_at || '—') + '</strong> via Flink interval join on topic <code>ory_missed_approach</code>.<br>' +
-            'Alert published to Kafka topic <code>ory_repeated_goaround</code>.</p>';
+            'Alert published to Kafka topic <code>ory_repeated_goaround</code>.</p>' +
+            _adsSection(a);
         }
 
         /* ─── Rapid Descent drawer ─── */
@@ -2302,7 +2470,8 @@ data:
             '<h3>Detection</h3>' +
             '<p>Detected at <strong>' + (a._received_at || '—') + '</strong> via Flink streaming filter on <code>adsb_raw</code>.<br>' +
             'Alert published to Kafka topic <code>ory_rapid_descent</code>.</p>' +
-            (a.detection_ts ? '<p style="color:#8b949e;font-size:11px;">detection_ts: ' + a.detection_ts + '</p>' : '');
+            (a.detection_ts ? '<p style="color:#8b949e;font-size:11px;">detection_ts: ' + a.detection_ts + '</p>' : '') +
+            _adsSection(a);
         }
 
         /* ─── Corridor Overload drawer ─── */
@@ -2358,7 +2527,8 @@ data:
             '<h3>Detection</h3>' +
             '<p>Detected at <strong>' + (a._received_at || '—') + '</strong> via Flink <code>TUMBLE(30 s)</code> aggregate on <code>ory_approach_cep4</code>.<br>' +
             'Alert published to Kafka topic <code>ory_corridor_overload</code>.</p>' +
-            (a.window_start ? '<p style="color:#8b949e;font-size:11px;">Window: ' + a.window_start + ' → ' + a.window_end + '</p>' : '');
+            (a.window_start ? '<p style="color:#8b949e;font-size:11px;">Window: ' + a.window_start + ' → ' + a.window_end + '</p>' : '') +
+            _adsSection(a);
         }
 
         /* ══════════════════════ AVIATION FLIGHT TRACKER JS ══════════════════════ */

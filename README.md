@@ -34,6 +34,13 @@ adsb-producer  ─────────────────────�
       │           (all 5 output topics)              │
       ▼                                              ▼
 alerts-dashboard (Flask)                    test_cep.py (validation)
+         │ (opt-in: ADS_ENABLED=true)
+         ▼
+IBM ADS Runtime  ◄──  flight-alert-classifier decision service
+(severity + ATC action classification)
+         │
+         ▼ (enriched alert)
+alerts-dashboard (Flask) continued
          │
          ▼
   /metrics (Prometheus)
@@ -399,6 +406,7 @@ The alerts-dashboard exposes a `/metrics` endpoint scraped by the OpenShift user
 | `cep_alerts_total` | Counter | `topic`, `source` | Total CEP alerts accepted (after dedup). `source` = `live` or `simulated`. |
 | `cep_alerts_in_window` | Gauge | `topic`, `source` | Current number of alerts held in the dashboard deque (snapshot every 10 s). |
 | `adsb_raw_vectors_total` | Gauge | — | Number of raw ADS-B vectors currently held in memory. |
+| `cep_ads_decisions_total` | Counter | `severity` | Total IBM ADS enrichments successfully applied. `severity` = `CRITICAL` \| `HIGH` \| `MEDIUM` \| `LOW` \| `INFO`. Only present when `ADS_ENABLED=true`. |
 
 `topic` values: `ory_missed_approach`, `ory_twin_landing`, `ory_repeated_goaround`, `ory_rapid_descent`, `ory_corridor_overload`.
 
@@ -434,6 +442,80 @@ spec:
 > **Why `plane-track` and not `test-app`?** The user-workload Prometheus has `ignoreNamespaceSelectors: true`, which means it always scrapes services in the **same namespace as the ServiceMonitor**, regardless of any `namespaceSelector` field. A ServiceMonitor in `test-app` would only discover services in `test-app` and never reach `plane-track`.
 
 A `RoleBinding` (`prometheus-user-workload-scrape`) grants the `prometheus-user-workload` ServiceAccount `view` access on the `plane-track` namespace so it can scrape pod endpoints.
+
+---
+
+## IBM ADS Integration (optional enrichment)
+
+The alerts-dashboard can enrich every CEP alert with a **severity classification** and **recommended ATC action** by calling the [IBM Automation Decision Services](https://www.ibm.com/docs/en/cloud-paks/cp-biz-automation) (ADS) runtime after each dedup-passed alert.
+
+The integration is **opt-in** and **fully backward-compatible** — the dashboard operates identically without it. ADS is activated via three environment variables.
+
+### Decision service
+
+| Artifact | Location |
+|---|---|
+| DMN source | `ads-decision-service/src/main/resources/com/ibm/planetrack/` |
+| Top-level DRD | `FlightAlertClassifier.dmn` |
+| Severity table | `decisions/SeverityRules.dmn` — PRIORITY table, 13 rules, 5 CEP types |
+| Action table | `decisions/ActionRules.dmn` — UNIQUE table, 15 rules, maps severity+type → ATC action |
+| Input type | `types/AlertInput.dmn` |
+| Output type | `types/AlertDecision.dmn` — `severity`, `recommended_action`, `escalation_required`, `rationale`, `display_color` |
+| Import guide | `ads-decision-service/README.md` |
+
+### Severity scale
+
+| Severity | Colour | Meaning |
+|---|---|---|
+| `CRITICAL` | 🔴 `#c00` | Immediate ATC intervention required |
+| `HIGH` | 🟠 `#e65c00` | Urgent attention — escalation likely |
+| `MEDIUM` | 🟡 `#b38600` | Elevated awareness, monitor closely |
+| `LOW` | 🔵 `#1a73e8` | Informational — track only |
+| `INFO` | ⚫ `#555` | Normal operations, no action needed |
+
+### Activation
+
+After importing and deploying the decision service in ADS Decision Center:
+
+```bash
+# Find your runtime execute URL:
+# Decision Center → deployed service → Help → API access → Swagger UI
+# Copy the URL for the classifyFlightAlert operation
+
+oc set env -n plane-track deployment/alerts-dashboard \
+  ADS_ENABLED="true" \
+  ADS_ENDPOINT="https://<ads-runtime-host>/deploymentSpaces/embedded/decisions/<decisionId>/operations/classifyFlightAlert/execute" \
+  ADS_API_KEY="YOUR_ZENAPI_KEY"   # ZenApiKey token from CP4BA
+
+oc rollout restart -n plane-track deployment/alerts-dashboard
+```
+
+| Variable | Default | Description |
+|---|---|---|
+| `ADS_ENABLED` | `false` | Set to `true` to activate the enrichment |
+| `ADS_ENDPOINT` | — | Full execute URL (see above) |
+| `ADS_API_KEY` | — | ZenApiKey token |
+| `ADS_TIMEOUT` | `3` | HTTP timeout in seconds (non-blocking — failures are silently skipped) |
+
+### What changes in the UI
+
+When ADS is active, each alert card gains a **⚡ IBM ADS Decision** badge. Clicking **View details →** opens a drawer section that shows:
+
+- Severity chip (colour-coded per the table above)
+- **ESCALATE** badge when `escalation_required = true`
+- Recommended ATC action
+- Decision rationale
+
+When ADS is inactive the badge and drawer section are simply absent — no errors, no empty boxes.
+
+### Packaging the DMN project
+
+```bash
+cd ads-decision-service
+bash package.sh          # produces flight-alert-classifier.zip
+```
+
+Import `flight-alert-classifier.zip` into the `plane-track` space in ADS Decision Center (see `ads-decision-service/README.md` for step-by-step instructions).
 
 ---
 
@@ -485,3 +567,14 @@ A `RoleBinding` (`prometheus-user-workload-scrape`) grants the `prometheus-user-
 | `09-alerts-dashboard.yaml` | New `RoleBinding` `prometheus-user-workload-scrape` in `plane-track` — grants `view` to `prometheus-user-workload` SA so it can scrape pod endpoints across namespaces. |
 | `09-alerts-dashboard.yaml` | `ServiceMonitor` moved to `test-app` namespace with `namespaceSelector: plane-track`, matching the `aviation-tracker` pattern. |
 | `monitoring-plane-track-dashboard.yaml` | New Grafana dashboard (`uid: plane-track`) — 31 panels covering pipeline health, CEP alert counters by type, time series (accumulation / rate / window), restarts, CPU/RAM, network. |
+
+### 2026 — IBM ADS decision enrichment
+
+| File | Change |
+|---|---|
+| `ads-decision-service/` | New directory. DMN decision service (`flight-alert-classifier`) for ADS: `FlightAlertClassifier.dmn` (top-level DRD), `types/AlertInput.dmn`, `types/AlertDecision.dmn`, `decisions/SeverityRules.dmn` (PRIORITY, 13 rules), `decisions/ActionRules.dmn` (UNIQUE, 15 rules). |
+| `ads-decision-service/README.md` | Import + deploy guide: real ADS URL structure, ZenApiKey auth, `oc set env` activation commands, curl test examples. |
+| `ads-decision-service/package.sh` | Packaging script — produces `flight-alert-classifier.zip` for import into ADS Decision Center. |
+| `09-alerts-dashboard.yaml` | `ADS_ENABLED`, `ADS_ENDPOINT`, `ADS_API_KEY`, `ADS_TIMEOUT` env vars (all off by default). `_classify_with_ads()` function. ADS enrichment call in `_consume()` after dedup. Five `_ads_*` fields stamped on each alert dict. ADS badge on alert cards. `_adsSection()` drawer block in all 5 CEP detail drawers. |
+| `09-alerts-dashboard.yaml` | New Prometheus counter `cep_ads_decisions_total` (label `severity`) incremented on every successful ADS call. |
+| `README.md` | New **IBM ADS Integration** section. Architecture diagram updated with ADS enrichment hop. Prometheus metrics table updated. |
